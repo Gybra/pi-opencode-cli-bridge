@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   calculateCost,
@@ -103,7 +103,21 @@ let lastDiscoveryTime: number | undefined;
 let lastDiscoveryError: string | undefined;
 
 function opencodeBin(): string {
-  return process.env.OPENCODE_PI_BIN?.trim() || "opencode";
+  const configured = process.env.OPENCODE_PI_BIN?.trim();
+  if (configured) return configured;
+  if (process.platform === "win32") {
+    // npm's `opencode.cmd` shim cannot be launched by spawn() without a shell.
+    // Resolve the native executable installed beside the active Node runtime.
+    const native = join(
+      dirname(process.execPath),
+      "node_modules",
+      "opencode-ai",
+      "bin",
+      "opencode.exe",
+    );
+    if (existsSync(native)) return native;
+  }
+  return "opencode";
 }
 
 function configuredModels(): string[] | undefined {
@@ -1281,32 +1295,32 @@ function buildContinuationPrompt(deltaParts: string[]): string {
 
 async function createTempAgentDir(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "opencode-pi-"));
-  const agentsDir = join(dir, ".opencode", "agents");
+  const configDir = join(dir, ".opencode");
+  const agentsDir = join(configDir, "agents");
+  const pluginsDir = join(configDir, "plugins");
   await mkdir(agentsDir, { recursive: true });
+  await mkdir(pluginsDir, { recursive: true });
   await writeFile(
     join(agentsDir, `${AGENT_ID}.md`),
     `---
-description: Pi bridge agent. OpenCode tools are denied; Pi tool calls are emitted as text markers.
+description: Pi bridge agent. Pi tool calls are emitted as text markers.
 mode: primary
-permission:
-  "*": deny
-  read: deny
-  edit: deny
-  glob: deny
-  grep: deny
-  list: deny
-  bash: deny
-  task: deny
-  external_directory: deny
-  todowrite: deny
-  webfetch: deny
-  websearch: deny
-  lsp: deny
-  skill: deny
-  question: deny
-  doom_loop: deny
 ---
-You are the OpenCode side of a Pi Coding Agent bridge. OpenCode tools are disabled. Reply in plain text, or emit <pi_tool_call>{"name":"...","arguments":{...}}</pi_tool_call> exactly when the prompt asks you to request a Pi tool.
+You are the OpenCode side of a Pi Coding Agent bridge. Do not use OpenCode native tools. Reply in plain text, or emit <pi_tool_call>{"name":"...","arguments":{...}}</pi_tool_call> exactly when the prompt asks you to request a Pi tool.
+`,
+    "utf8",
+  );
+  // Zen's free tier requires OpenCode's normal tool declarations to remain in
+  // the request. Permission `deny` removes them before inference and is now
+  // rejected as a third-party client. Keep declarations intact, but block
+  // every native execution before side effects occur.
+  await writeFile(
+    join(pluginsDir, "pi-native-tool-blocker.js"),
+    `export const PiNativeToolBlocker = async () => ({
+  "tool.execute.before": async (input) => {
+    throw new Error("Native OpenCode tool blocked by opencode-pi: " + input.tool)
+  },
+})
 `,
     "utf8",
   );
@@ -1390,7 +1404,6 @@ export function streamOpenCode(
       if (options?.signal?.aborted) throw new Error("Request was aborted");
       const args = [
         "run",
-        "--pure",
         "-m",
         model.id,
         "--agent",
@@ -1413,7 +1426,13 @@ export function streamOpenCode(
 
       const child = spawn(opencodeBin(), args, {
         stdio: ["pipe", "pipe", "pipe"],
-        env: { ...process.env, OPENCODE_DISABLE_UPDATE_CHECK: "1" },
+        env: {
+          ...process.env,
+          OPENCODE_DISABLE_UPDATE_CHECK: "1",
+          // Isolate the blocker from the user's global OpenCode plugins while
+          // allowing this project-local safety hook to load.
+          OPENCODE_CONFIG_DIR: join(sessionDir, ".opencode"),
+        },
       });
 
       const abort = () => child.kill("SIGTERM");

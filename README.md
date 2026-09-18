@@ -1,5 +1,7 @@
 # opencode-pi
 
+> Fork compatibility note: this version keeps OpenCode's native tool declarations on the inference request (required by the current Zen free-tier validation), but blocks every native tool in a `tool.execute.before` hook before side effects occur. It also resolves npm's native `opencode.exe` automatically on Windows.
+
 `opencode-pi` registers an `opencode-cli` provider in Pi and delegates model calls to the local `opencode` CLI.
 
 ![opencode-pi screenshot](../../assets/opencode-pi.png)
