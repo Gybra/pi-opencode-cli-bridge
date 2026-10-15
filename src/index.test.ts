@@ -536,6 +536,15 @@ test("parseToolCallResponse keeps DSML and marker calls in response order", () =
   assert.deepEqual(parseToolCalls(read + write, tools).map((call) => call.name), ["read", "write"]);
 });
 
+test("parseToolCallResponse leaves DSML text inside marker arguments untouched", () => {
+  const calls = [
+    { name: "bash", arguments: { command: "rg '<｜DSML｜invoke' src/index.ts" } },
+    { name: "write", arguments: { path: "fixture.txt", content: dsmlResponse } },
+  ];
+  const response = calls.map((call) => `<pi_tool_call>${JSON.stringify(call)}</pi_tool_call>`).join("\n");
+  assert.deepEqual(parseToolCalls(response, new Set(["bash", "write"])), calls);
+});
+
 test("parseToolCallResponse rejects a complete DSML block followed by an unclosed one", () => {
   const unclosed = dsmlResponse.split("\n").slice(1, 4).join("\n");
   assert.deepEqual(parseToolCallResponse(`${dsmlResponse}\n${unclosed}`, new Set(["bash", "read"])), {
