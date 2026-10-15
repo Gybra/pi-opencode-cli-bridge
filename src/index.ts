@@ -958,38 +958,55 @@ const DSML_BLOCK = new RegExp(String.raw`<${DSML}(?:tool|function)_calls>([\s\S]
 const DSML_INVOKE = new RegExp(String.raw`<${DSML}invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/${DSML}invoke>`, "g");
 const DSML_PARAMETER = new RegExp(String.raw`<${DSML}parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>([\s\S]*?)<\/${DSML}parameter>`, "g");
 
-function dsmlToMarkers(text: string): string {
-  return text.replace(DSML_BLOCK, (_block, body: string) => {
-    let markers = "";
-    for (const [, name, params] of body.matchAll(DSML_INVOKE)) {
-      const args: Record<string, unknown> = {};
-      for (const [, key, isString, raw] of params.matchAll(DSML_PARAMETER)) {
-        if (isString === "true") {
-          args[key] = raw;
-          continue;
-        }
-        try {
-          args[key] = JSON.parse(raw);
-        } catch {
-          args[key] = raw;
-        }
+function dsmlBlockToMarkers(_block: string, body: string): string {
+  let markers = "";
+  for (const [, name, params] of body.matchAll(DSML_INVOKE)) {
+    const args: Record<string, unknown> = {};
+    for (const [, key, isString, raw] of params.matchAll(DSML_PARAMETER)) {
+      if (isString === "true") {
+        args[key] = raw;
+        continue;
       }
-      markers += `${MARKER_OPEN}${JSON.stringify({ name, arguments: args })}</pi_tool_call>`;
+      try {
+        args[key] = JSON.parse(raw);
+      } catch {
+        args[key] = raw;
+      }
     }
-    return markers;
-  });
+    markers += `${MARKER_OPEN}${JSON.stringify({ name, arguments: args })}</pi_tool_call>`;
+  }
+  return markers;
+}
+
+// Only text outside existing markers is rewritten, so marker arguments that
+// quote DSML (a grep pattern, a file being written) stay intact. Returns
+// undefined for a truncated DSML block, which would otherwise end the turn
+// silently or let Pi run only the calls before it.
+function dsmlToMarkers(text: string): string | undefined {
+  const extraction = isToolCallMarkerResponse(text) ? toolCallMarkers(text) : undefined;
+  const spans = extraction
+    ? [...extraction.markers, ...extraction.invalidSpans].sort((a, b) => a.start - b.start)
+    : [];
+  let result = "";
+  let cursor = 0;
+  for (const span of [...spans, { start: text.length, end: text.length }]) {
+    if (span.start < cursor) continue;
+    const outside = text.slice(cursor, span.start);
+    if (DSML_TAG.test(outside.replace(DSML_BLOCK, ""))) return undefined;
+    result += outside.replace(DSML_BLOCK, dsmlBlockToMarkers) + text.slice(span.start, span.end);
+    cursor = span.end;
+  }
+  return result;
 }
 
 export function parseToolCallResponse(
   text: string,
   allowedToolNames?: ReadonlySet<string>,
 ): ToolCallParseResult {
-  // A truncated DSML block would otherwise end the turn silently, or let Pi
-  // run only the calls before it.
-  if (DSML_TAG.test(text.replace(DSML_BLOCK, ""))) {
+  const normalizedText = dsmlToMarkers(normalizeQuotedToolCallResponse(text));
+  if (normalizedText === undefined) {
     return { ok: false, rejection: { reason: "incomplete_dsml" } };
   }
-  const normalizedText = normalizeQuotedToolCallResponse(dsmlToMarkers(text));
   if (!isToolCallMarkerResponse(normalizedText)) return { ok: true, calls: [] };
 
   const extraction = toolCallMarkers(normalizedText);
