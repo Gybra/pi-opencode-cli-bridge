@@ -1,0 +1,145 @@
+// Runs the real OpenCode CLI against a local OpenAI-compatible fixture that asks
+// for native side effects. Needs OpenCode 1.19.0: set OPENCODE_PI_INTEGRATION_BIN
+// or put `opencode` on PATH. No network access or credentials are used.
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import type { Api, Model } from "@earendil-works/pi-ai";
+import { cleanupPiSessionState, streamOpenCode } from "./index.js";
+
+const OPENCODE_VERSION = "1.19.0";
+const realBin = process.env.OPENCODE_PI_INTEGRATION_BIN || "opencode";
+
+type Recorded = { tools: string[]; toolResults: number };
+
+/** OpenAI-compatible SSE fixture: ask for native tools once, then answer with text. */
+async function startFixture() {
+  const requests: Recorded[] = [];
+  const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    if (req.method !== "POST" || !req.url?.endsWith("/chat/completions")) {
+      res.writeHead(404).end();
+      return;
+    }
+    const request = JSON.parse(body) as {
+      tools?: { function?: { name?: string } }[];
+      messages?: { role: string; content?: unknown }[];
+    };
+    const tools = (request.tools ?? []).map((tool) => tool.function?.name ?? "");
+    const toolResults = (request.messages ?? []).filter((message) => message.role === "tool").length;
+    requests.push({ tools, toolResults });
+
+    const base = { id: "chatcmpl-fixture", object: "chat.completion.chunk", created: 1, model: "model" };
+    const send = (choices: unknown[]) => res.write(`data: ${JSON.stringify({ ...base, choices })}\n\n`);
+    res.writeHead(200, { "content-type": "text/event-stream" });
+    if (tools.includes("write") && toolResults === 0) {
+      send([{ index: 0, delta: { role: "assistant", tool_calls: [
+        { index: 0, id: "call_write", type: "function", function: { name: "write", arguments: JSON.stringify({ filePath: "write-sentinel.txt", content: "native write ran" }) } },
+        { index: 1, id: "call_bash", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: "echo native bash ran > bash-sentinel.txt", description: "Write sentinel" }) } },
+      ] }, finish_reason: null }]);
+      send([{ index: 0, delta: {}, finish_reason: "tool_calls" }]);
+    } else {
+      send([{ index: 0, delta: { role: "assistant", content: "done" }, finish_reason: null }]);
+      send([{ index: 0, delta: {}, finish_reason: "stop" }]);
+    }
+    res.end("data: [DONE]\n\n");
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  return { requests, port, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+}
+
+function fixtureModel(): Model<Api> {
+  return {
+    id: "fixture/model", name: "Fixture", api: "opencode-cli-runner", provider: "opencode-cli", baseUrl: "",
+    reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 64_000, maxTokens: 4_096,
+  };
+}
+
+/** Wraps the real CLI: records the project directory and optionally sabotages the blocker plugin. */
+function writeWrapper(dir: string, mode: "intact" | "missing" | "failing"): string {
+  const wrapper = join(dir, "opencode-wrapper.cjs");
+  writeFileSync(wrapper, `#!/usr/bin/env node
+const fs = require("node:fs"), path = require("node:path"), { spawn } = require("node:child_process");
+if (process.argv[2] === "run") {
+  const configDir = process.env.OPENCODE_CONFIG_DIR;
+  fs.writeFileSync(${JSON.stringify(join(dir, "project-dir"))}, path.dirname(configDir));
+  const plugin = path.join(configDir, "plugins", "pi-native-tool-blocker.js");
+  if (${JSON.stringify(mode)} === "missing") fs.rmSync(plugin, { force: true });
+  if (${JSON.stringify(mode)} === "failing") fs.writeFileSync(plugin, 'export const PiNativeToolBlocker = async () => { throw new Error("blocker init failed") }\\n');
+}
+const child = spawn(${JSON.stringify(realBin)}, process.argv.slice(2), { stdio: "inherit" });
+child.on("exit", (code) => process.exit(code ?? 1));
+`, "utf8");
+  chmodSync(wrapper, 0o755);
+  return wrapper;
+}
+
+function isolatedEnv(home: string, port: number): Record<string, string> {
+  return {
+    HOME: home,
+    XDG_CONFIG_HOME: join(home, "config"),
+    XDG_DATA_HOME: join(home, "data"),
+    XDG_CACHE_HOME: join(home, "cache"),
+    XDG_STATE_HOME: join(home, "state"),
+    OPENCODE_DISABLE_AUTOUPDATE: "1",
+    OPENCODE_DISABLE_MODELS_FETCH: "1",
+    OPENCODE_CONFIG_CONTENT: JSON.stringify({
+      share: "disabled",
+      small_model: "fixture/model",
+      provider: {
+        fixture: {
+          npm: "@ai-sdk/openai-compatible",
+          name: "Fixture",
+          options: { baseURL: `http://127.0.0.1:${port}/v1`, apiKey: "fixture" },
+          models: { model: { name: "Fixture", tool_call: true, limit: { context: 64_000, output: 4_096 } } },
+        },
+      },
+    }),
+  };
+}
+
+test("real OpenCode CLI version matches the pinned integration target", () => {
+  const version = execFileSync(realBin, ["--version"], { encoding: "utf8" }).trim();
+  assert.equal(version, OPENCODE_VERSION, `set OPENCODE_PI_INTEGRATION_BIN to OpenCode ${OPENCODE_VERSION}`);
+});
+
+for (const mode of ["intact", "missing", "failing"] as const) {
+  test(`native write and bash never run when the blocker plugin is ${mode}`, { timeout: 90_000 }, async () => {
+    const dir = mkdtempSync(join(tmpdir(), `pi-native-${mode}-`));
+    const fixture = await startFixture();
+    const previousBin = process.env.OPENCODE_PI_BIN;
+    const sessionId = `pi-native-${mode}-${Date.now()}`;
+    process.env.OPENCODE_PI_BIN = writeWrapper(dir, mode);
+    try {
+      const message = await streamOpenCode(fixtureModel(), {
+        messages: [{ role: "user", content: "Use your native tools.", timestamp: 1 }],
+      }, { sessionId, timeoutMs: 60_000, env: isolatedEnv(join(dir, "home"), fixture.port) }).result();
+
+      const project = readFileSync(join(dir, "project-dir"), "utf8");
+      // Declarations stay on the request, and the fixture really asked for both calls.
+      const first = fixture.requests.find((request) => request.tools.includes("write"));
+      assert.ok(first, "native tool declarations were not sent to the model");
+      assert.ok(first.tools.includes("bash"));
+      assert.equal(existsSync(join(project, "write-sentinel.txt")), false, "native write executed");
+      assert.equal(existsSync(join(project, "bash-sentinel.txt")), false, "native bash executed");
+      // `opencode run` emits tool_use only once a call has completed or failed,
+      // so this proves OpenCode handled a native call rather than skipping it.
+      assert.equal(message.stopReason, "error");
+      assert.match(message.errorMessage ?? "", /disabled native tool \("(write|bash)"\)/);
+    } finally {
+      process.env.OPENCODE_PI_BIN = previousBin;
+      if (previousBin === undefined) delete process.env.OPENCODE_PI_BIN;
+      await cleanupPiSessionState(sessionId);
+      await fixture.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}

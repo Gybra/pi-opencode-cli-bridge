@@ -1279,6 +1279,8 @@ async function createTempAgentDir(): Promise<string> {
     `---
 description: Pi bridge agent. Pi tool calls are emitted as text markers.
 mode: primary
+permission:
+  "*": ask
 ---
 You are the OpenCode side of a Pi Coding Agent bridge. Do not use OpenCode native tools. Reply in plain text, or emit <pi_tool_call>{"name":"...","arguments":{...}}</pi_tool_call> exactly when the prompt asks you to request a Pi tool.
 `,
@@ -1287,7 +1289,9 @@ You are the OpenCode side of a Pi Coding Agent bridge. Do not use OpenCode nativ
   // Zen's free tier requires OpenCode's normal tool declarations to remain in
   // the request. Permission `deny` removes them before inference and is now
   // rejected as a third-party client. Keep declarations intact, but block
-  // every native execution before side effects occur.
+  // every native execution before side effects occur. The agent's `ask`
+  // permission keeps declarations too, and `opencode run` auto-rejects asks,
+  // so a plugin that fails to load still cannot run native tools.
   await writeFile(
     join(pluginsDir, "pi-native-tool-blocker.js"),
     `export const PiNativeToolBlocker = async () => ({

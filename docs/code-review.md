@@ -6,7 +6,21 @@ This bridge delegates Pi model turns to an OpenCode subprocess, then converts te
 
 Reviewed the model discovery, prompt serialization, tool-marker parser, subprocess I/O, session reuse, temporary files, package metadata and tests. Compared the implementation with installed `pi-whatsapp` 0.3.0 and `@gybra/pi-tg` 0.2.0, their GitHub test workflows, and Pi 1.2.0's extension and custom-provider documentation.
 
-**Verdict: the Pi 1.2 crash fix works, but the inherited process and event handling is not yet at the same hardening level as the reference integrations.** The findings below are deliberately not hidden behind a green unit suite.
+**Original verdict: the Pi 1.2 crash fix worked, but the inherited process and event handling was not at the same hardening level as the reference integrations.** The findings are kept below as written; the resolution section records what changed for 0.1.0.
+
+## Resolution in 0.1.0
+
+Each fix started from a test that failed against the previous code.
+
+| Finding | Resolution | Evidence |
+| --- | --- | --- |
+| 1. Unbounded termination | `src/process.ts` owns every CLI subprocess: discovery, status, model turns and session deletion. Timeout, abort and consumer failures send `SIGTERM` to the process group, then `SIGKILL` after 250 ms, and settle even if pipes stay open or an async observer never returns. | Process tests with `SIGTERM`-ignoring children for timeout and abort, a blocked observer, `EPIPE` and missing executables; stream test bounded under 2 s. |
+| 2. Invalid event envelopes | Events are decoded from `unknown`; malformed JSON, non-object envelopes and bad `part` bodies end the turn with an error. Events are consumed sequentially inside the process boundary. | `null`, `[]`, scalars, `{}` and `part: null` run in a child Node process that must exit 0 with one terminal error. |
+| 3. Unawaited shutdown | `session_shutdown` returns the cleanup promise, which awaits directory removal and every pending bounded session deletion. | The registered handler is invoked; the project directory and a deliberately slow deletion are both complete when it resolves. |
+| 4. Ignored instrumentation | `onPayload` receives `{ prompt }` and may replace it (validated); `onResponse` reports the CLI transport (`status: 0`, `x-pi-transport: opencode-cli`); `onProviderStreamEvent` is awaited per validated event. A payload hook forces a fresh OpenCode session. Provider `env` reaches the CLI without overriding bridge settings. | Order, replacement on actual stdin, invalid payloads, callback failures, cancellation while each hook waits, session freshness and env tests. |
+| 5. Native-tool guard coverage | Integration test with the real OpenCode 1.19.0 CLI and a local OpenAI-compatible fixture requesting native `write` and `bash`. It showed the plugin alone fails open: with the plugin removed or failing at startup, OpenCode wrote the sentinel file. The agent now also sets `permission: { "*": ask }`; declarations stay on the request and `opencode run` auto-rejects the ask. | Intact, missing and failing plugin scenarios pass; removing only the permission rule makes the last two fail again. A live DeepSeek v4.1 Flash Free text and Pi `read` run still succeed through Zen with the new agent. |
+
+Residual risks: the guard is verified only for OpenCode 1.19.0. Your own OpenCode configuration is still loaded, and tools it adds, such as MCP servers, were not tested. Neither layer is a sandbox. Linux CI covers the fixture, not a hosted model; Windows and high-thinking reliability remain unverified.
 
 ## What already follows the expected practices
 
@@ -90,4 +104,4 @@ This fork now uses a distinct package identity, Node 22.19+ and documented Pi 1.
 - Live macOS checks: DeepSeek v4.1 Flash Free returned `OK`, and a Pi `read` tool call read a fresh test file and returned its exact contents. Both used thinking off.
 - Review probes reproduced findings 1 and 2 in isolated Node processes and demonstrated the missing callbacks in finding 4. Test processes and files were bounded and isolated from personal data.
 - Not checked: real-model behavior on Linux or Windows, OpenCode 2.x, high-thinking reliability, adversarial native-tool execution, provider legal compliance or upstream service internals.
-- This review was performed by the implementing assistant, not an independent reviewer. It changed package/documentation setup, not the inherited defects above.
+- This review and the 0.1.0 fixes were performed by the implementing assistant, not an independent reviewer.

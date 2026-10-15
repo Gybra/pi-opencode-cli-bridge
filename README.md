@@ -4,21 +4,35 @@ Use the local [OpenCode CLI](https://opencode.ai) as a model backend for [Pi Cod
 
 This is an unofficial bridge, not an OpenCode or Pi product. It registers the `opencode-cli` provider and sends model requests through `opencode run`.
 
+## Why this fork exists
+
+The bridge started as `opencode-pi`. Rodrigo Jager's fork then kept OpenCode's native tool declarations on each request, which OpenCode's free tier expects, and blocked their execution with a plugin. On Pi 1.2 that version stopped working: Pi now carries the system prompt and tool list inside the transcript, and every request crashed with `message.content.map is not a function`.
+
+This fork fixes that and closes the gaps found while reviewing the code:
+
+- **Works with Pi 1.2.** The current system prompt, prompt sections and tool changes are read from the transcript, so tool calls work again.
+- **Native OpenCode tools cannot run, even if the safety plugin fails.** A test with the real CLI showed that the plugin alone failed open: if it was missing or crashed at startup, OpenCode wrote files. The bridge's agent now also requires permission for every native tool, which `opencode run` refuses automatically.
+- **No hung turns or orphaned processes.** Timeouts and cancellation kill the OpenCode process group, even when it ignores `SIGTERM`.
+- **Unexpected CLI output no longer crashes Pi.** Malformed events end the turn with an error.
+- **Clean shutdown.** Pi waits for temporary directories and OpenCode session records to be removed.
+- **Standard Pi provider hooks.** `onPayload`, `onResponse` and `onProviderStreamEvent` work as with built-in providers.
+- **Its own npm package**, with the original authors credited.
+
 ## Credits and fork history
 
 This package builds on other people's work:
 
 - **[luongnv89 and the pi-extensions contributors](https://github.com/luongnv89/pi-extensions/tree/main/extensions/opencode-pi)** created the original `opencode-pi` extension.
 - **[Rodrigo Manuel Jager Pinheiro](https://github.com/rodrigojager/opencode-pi)** extracted the extension and added the native-tool execution blocker for compatibility with OpenCode's free-tier request validation, plus Windows executable resolution.
-- **[Gybra](https://github.com/Gybra/pi-opencode-cli-bridge)** maintains this fork, adds Pi 1.2 transcript compatibility and regression tests, and packages it under a distinct name.
+- **[Gybra](https://github.com/Gybra/pi-opencode-cli-bridge)** maintains this fork, adds Pi 1.2 transcript compatibility, process and protocol hardening, provider hooks, a second native-tool guard with real-CLI integration tests, and packages it under a distinct name.
 
 The original MIT copyright notice is preserved in [LICENSE](LICENSE). The new package name does not change that attribution.
 
-## Requirements and tested support
+## Requirements
 
 - Node.js **22.19.0 or newer**.
 - Pi Coding Agent **1.2.0 or newer**; the development SDK is pinned to 1.2.0.
-- OpenCode installed on the same machine and available on `PATH`, or selected with `OPENCODE_PI_BIN`.
+- OpenCode installed on the same machine and available on `PATH`, or selected with `OPENCODE_PI_BIN`. Tested with OpenCode 1.19.0; other versions, including 2.x, are unverified.
 
 Check OpenCode before starting Pi:
 
@@ -27,17 +41,15 @@ opencode --version
 opencode models opencode --verbose
 ```
 
-| Platform | Verification |
-| --- | --- |
-| macOS | Tested with Pi 1.2.0 and OpenCode 1.19.0: DeepSeek v4.1 Flash Free text response and a file read through Pi's own tool, with thinking off. |
-| Linux | Not yet verified end to end against a real model. |
-| Windows | Experimental. Native executable resolution is inherited from Rodrigo's fork; real-model behavior has not been verified here. |
-
-OpenCode 2.x has not been verified. Its CLI arguments may differ.
-
 ## Install
 
-Install **this fork from GitHub** with Pi's package manager:
+Install from npm with Pi's package manager:
+
+```sh
+pi install npm:pi-opencode-cli-bridge
+```
+
+Or track the GitHub repository directly:
 
 ```sh
 pi install git:github.com/Gybra/pi-opencode-cli-bridge
@@ -53,15 +65,9 @@ pi uninstall npm:opencode-pi
 pi uninstall git:github.com/rodrigojager/opencode-pi
 ```
 
-The intended npm package name is **`pi-opencode-cli-bridge`**. Until an npm release is published, use the GitHub command above. The npm packages `opencode-pi`, `pi-opencode` and `pi-opencode-bridge` are different packages.
+The npm packages `opencode-pi`, `pi-opencode` and `pi-opencode-bridge` are different packages.
 
-Manage this installation with:
-
-```sh
-pi list
-pi update git:github.com/Gybra/pi-opencode-cli-bridge
-pi uninstall git:github.com/Gybra/pi-opencode-cli-bridge
-```
+Manage the installation with `pi list`, `pi update <source>` and `pi uninstall <source>`, using the source you installed (`npm:pi-opencode-cli-bridge` or `git:github.com/Gybra/pi-opencode-cli-bridge`).
 
 ## Usage
 
@@ -106,7 +112,7 @@ Without an override, discovery selects active models whose reported input and ou
 
 1. The extension discovers models through the local CLI.
 2. It replays Pi's transcript system messages to recover the current system prompt and tool declarations, including later changes.
-3. It creates a temporary OpenCode project containing a `pi-model` agent and a `tool.execute.before` plugin. Native tool declarations remain on the request, while the plugin is intended to stop their execution.
+3. It creates a temporary OpenCode project containing a `pi-model` agent and a `tool.execute.before` plugin. Native tool declarations remain on the request. Execution is stopped twice: the plugin throws before any native tool runs, and the agent sets every permission to `ask`, which non-interactive `opencode run` rejects automatically. The second layer still holds if the plugin is missing or fails to load.
 4. It sends the prompt over standard input to `opencode run --format json`. User and tool-result images are written to temporary files and attached only when the model supports images.
 5. Text markers such as `<pi_tool_call>{"name":"read","arguments":{"path":"example.txt"}}</pi_tool_call>` become Pi tool calls. Tool names must be in the current Pi tool list; execution then follows Pi's normal validation and permission pipeline.
 6. Successful continuation turns reuse an OpenCode session and send only the new transcript. Changes to the model, prompt, tools or transcript prefix start a fresh session.
@@ -124,13 +130,13 @@ Reasoning variants, image support and token limits follow CLI discovery. Token u
 
 - Prompts, system instructions, tool declarations, conversation text and attached images pass to OpenCode and its model provider. Do not send confidential data unless that provider's policies are suitable.
 - The extension does not directly extract credentials or call model HTTP endpoints. The OpenCode subprocess still runs as your user and can use its own configuration, credentials and inherited environment.
-- The native-tool blocker is a guard rail, **not a sandbox**. Its behavior depends on OpenCode loading and honoring the plugin. It has not yet received an end-to-end negative test proving that native tools cannot run.
+- The native-tool guard is a guard rail, **not a sandbox**. An integration test runs the real OpenCode 1.19.0 CLI against a local model fixture that requests native `write` and `bash` calls, and checks that neither runs with the plugin intact, missing, or failing at startup. Other OpenCode versions, tools contributed by your own global OpenCode configuration (for example MCP servers), and a hostile local process are not covered.
 - Pi and OpenCode can both retain local conversation data. Best-effort cleanup is not a guarantee of secure deletion.
 - Free-tier model availability and accepted request shapes can change. This fork makes no guarantee of continued access or compliance with a hosted provider's terms; review the applicable terms yourself.
-- Thinking off passed the live tests above. The first high-thinking test timed out; no default thinking setting is changed by this package.
-- The inherited process handling and CLI event parser have outstanding defects described in the [code review](https://github.com/Gybra/pi-opencode-cli-bridge/blob/main/docs/code-review.md). In particular, a process that ignores `SIGTERM` can exceed its timeout, and a JSON `null` event can still crash the host.
+- Live tests with DeepSeek v4.1 Flash Free used thinking off. The first high-thinking test timed out; no default thinking setting is changed by this package.
+- Timeouts and cancellation escalate from `SIGTERM` to `SIGKILL` on the CLI's process group after 250 ms. Malformed or unexpected CLI events end the turn with an error instead of crashing Pi. Shutdown waits for session cleanup.
 
-See [SECURITY.md](SECURITY.md) for the trust boundaries. This is an experimental fork, not a claim that the inherited code has been fully hardened.
+See [SECURITY.md](SECURITY.md) for the trust boundaries and [docs/code-review.md](https://github.com/Gybra/pi-opencode-cli-bridge/blob/main/docs/code-review.md) for what was fixed and what remains. This is an experimental, unaudited fork.
 
 ## Development
 
@@ -138,10 +144,11 @@ See [SECURITY.md](SECURITY.md) for the trust boundaries. This is an experimental
 npm ci --ignore-scripts
 npm run typecheck
 npm test
+OPENCODE_PI_INTEGRATION_BIN="$(which opencode)" npm run test:integration
 npm pack --dry-run
 ```
 
-The automated suite uses a fake OpenCode executable and does not require API credentials or a real model request. Development SDKs are pinned; Pi supplies those packages at runtime. The npm archive includes the extension source, README, security policy and license, not tests or installed dependencies.
+`npm test` uses a fake OpenCode executable. `npm run test:integration` needs the real OpenCode CLI at exactly version 1.19.0 (on `PATH` or in `OPENCODE_PI_INTEGRATION_BIN`), runs it with isolated home and data directories against a local model fixture, and makes no network request. Neither suite needs API credentials. Development SDKs are pinned; Pi supplies those packages at runtime. The npm archive includes the extension source, README, security policy and license, not tests or installed dependencies.
 
 ## License
 

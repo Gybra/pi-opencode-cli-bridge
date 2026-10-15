@@ -26,5 +26,11 @@ jobs:
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm run typecheck
       - run: npm test
+      # Real CLI against a local model fixture; OpenCode's own postinstall fetches its platform binary.
+      - name: Install pinned OpenCode
+        run: npm install --prefix "$RUNNER_TEMP/opencode" --no-audit --no-fund opencode-ai@1.19.0
+      - run: npm run test:integration
+        env:
+          OPENCODE_PI_INTEGRATION_BIN: ${{ runner.temp }}/opencode/node_modules/.bin/opencode
       - name: Package contents
         run: npm pack --dry-run
