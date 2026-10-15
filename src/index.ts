@@ -4,10 +4,13 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerApiProvider } from "@earendil-works/pi-ai/compat";
 import {
   calculateCost,
   createAssistantMessageEventStream,
-  registerApiProvider,
+  getCurrentSystemPrompt,
+  getCurrentTools,
+  normalizeContext,
   type Api,
   type AssistantMessage,
   type AssistantMessageEventStream,
@@ -637,8 +640,8 @@ function safeJson(value: unknown): string {
 }
 
 function serializeMessage(message: Message): string {
-  if (message.role === "user") {
-    return `USER:\n${contentToText(message.content)}`;
+  if (message.role === "user" || message.role === "system") {
+    return `${message.role.toUpperCase()}:\n${contentToText(message.content)}`;
   }
 
   if (message.role === "toolResult") {
@@ -1365,9 +1368,16 @@ export function streamOpenCode(
         ? options.sessionId
         : undefined;
     const piState = piSessionId ? getPiSessionState(piSessionId) : undefined;
-    const transcriptParts = serializedTranscriptParts(context.messages);
 
     try {
+      // pi 1.x carries the current prompt and tools in transcript system messages.
+      const { messages } = normalizeContext(context);
+      context = {
+        messages: messages.filter((message) => message.role !== "system"),
+        systemPrompt: getCurrentSystemPrompt(messages),
+        tools: getCurrentTools(messages),
+      };
+      const transcriptParts = serializedTranscriptParts(context.messages);
       stream.push({ type: "start", partial: output });
       if (options?.signal?.aborted) throw new Error("Request was aborted");
 
@@ -1662,7 +1672,7 @@ export function streamOpenCode(
             type: "toolCall",
             id: `opencode_pi_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
             name: call.name,
-            arguments: call.arguments,
+            arguments: call.arguments as ToolCall["arguments"],
           };
           const contentIndex = output.content.length;
           output.content.push(toolCall);

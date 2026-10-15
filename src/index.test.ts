@@ -12,9 +12,9 @@ import { join } from "node:path";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
-  clearApiProviders,
+  resetApiProviders as clearApiProviders,
   getApiProvider,
-} from "@earendil-works/pi-ai";
+} from "@earendil-works/pi-ai/compat";
 import type {
   Api,
   AssistantMessageEvent,
@@ -883,9 +883,9 @@ process.stdout.write(JSON.stringify({ type: "text", part: { text: "ok" } }) + "\
       imageHex: string;
     };
     assert.equal(message.stopReason, "stop");
-    assert.deepEqual(invocation.args.slice(0, 8), [
+    assert.equal(invocation.args.includes("--pure"), false);
+    assert.deepEqual(invocation.args.slice(0, 7), [
       "run",
-      "--pure",
       "-m",
       "opencode/fake-free",
       "--agent",
@@ -1540,6 +1540,65 @@ process.stdin.on("end", () => {
 });
 `;
 }
+
+test("streamOpenCode accepts tool calls from normalized system declarations", { timeout: 3000 }, async () => {
+  const message = await withFakeOpenCode(
+    fakeEventScript([{ type: "text", part: { text: '<pi_tool_call>{"name":"read","arguments":{"path":"example.txt"}}</pi_tool_call>' } }]),
+    () => streamOpenCode(fakeModel(), {
+      messages: [
+        { role: "system", content: "", toolsAdded: fakeContext(["read"]).tools, timestamp: 0 },
+        { role: "user", content: "Read example.txt", timestamp: 1 },
+      ],
+    }).result(),
+  );
+  assert.equal(message.stopReason, "toolUse");
+  assert.deepEqual(message.content.map((part) => part.type === "toolCall" ? { name: part.name, arguments: part.arguments } : part), [
+    { name: "read", arguments: { path: "example.txt" } },
+  ]);
+});
+
+test("streamOpenCode replays normalized prompt sections and tool changes", { timeout: 3000 }, async () => {
+  const dir = mkdtempSync(join(tmpdir(), "opencode-pi-normalized-"));
+  const capturePath = join(dir, "invocations.jsonl");
+  try {
+    const message = await withFakeOpenCode(sessionFakeScript(capturePath, "ses-normalized"), () =>
+      streamOpenCode(fakeModel(), {
+        messages: [
+          {
+            role: "system", content: "Base instructions", timestamp: 0,
+            sections: { project: "Old project instructions", obsolete: "Obsolete instructions" },
+            toolsAdded: fakeContext(["read", "write"]).tools,
+          },
+          { role: "user", content: "First question", timestamp: 1 },
+          {
+            role: "system", content: [{ type: "text", text: "Additional instructions" }], timestamp: 2,
+            sections: { project: "New project instructions", obsolete: null },
+            toolsRemoved: [{ name: "read" }],
+          },
+          { role: "user", content: "Second question", timestamp: 3 },
+        ],
+      }).result(),
+    );
+    assert.equal(message.stopReason, "stop");
+    const prompt = readInvocations(capturePath)[0]?.stdin ?? "";
+    assert.match(prompt, /Base instructions/);
+    assert.match(prompt, /Additional instructions/);
+    assert.match(prompt, /New project instructions/);
+    assert.doesNotMatch(prompt, /Old project instructions|Obsolete instructions/);
+    const tools = JSON.parse(prompt.split("# Available Pi tools\n\n")[1].split("\n\n---\n\n")[0]);
+    assert.deepEqual(tools.map((tool: { name: string }) => tool.name), ["write"]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("streamOpenCode reports transcript preparation errors without crashing", { timeout: 3000 }, async () => {
+  const message = await streamOpenCode(fakeModel(), {
+    messages: [{ role: "assistant", content: null } as unknown as Message],
+  }).result();
+  assert.equal(message.stopReason, "error");
+  assert.match(message.errorMessage ?? "", /map/);
+});
 
 function readInvocations(capturePath: string): { args: string[]; stdin: string }[] {
   if (!existsSync(capturePath)) return [];
