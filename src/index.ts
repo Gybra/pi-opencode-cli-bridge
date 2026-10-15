@@ -954,11 +954,11 @@ function stripMarkerSpans(text: string, spans: MarkerSpan[]): string {
 // so call order and the tool-list check stay those of the marker parser.
 const DSML = String.raw`[｜|]+\s*DSML\s*[｜|]+`;
 const DSML_TAG = new RegExp(String.raw`<\/?${DSML}`);
-const DSML_BLOCK = new RegExp(String.raw`<${DSML}(?:tool|function)_calls>([\s\S]*?)<\/${DSML}(?:tool|function)_calls>`, "g");
+const DSML_BLOCK = new RegExp(String.raw`^<${DSML}(?:tool|function)_calls>([\s\S]*?)<\/${DSML}(?:tool|function)_calls>`);
 const DSML_INVOKE = new RegExp(String.raw`<${DSML}invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/${DSML}invoke>`, "g");
 const DSML_PARAMETER = new RegExp(String.raw`<${DSML}parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>([\s\S]*?)<\/${DSML}parameter>`, "g");
 
-function dsmlBlockToMarkers(_block: string, body: string): string {
+function dsmlBlockToMarkers(body: string): string {
   let markers = "";
   for (const [, name, params] of body.matchAll(DSML_INVOKE)) {
     const args: Record<string, unknown> = {};
@@ -978,25 +978,31 @@ function dsmlBlockToMarkers(_block: string, body: string): string {
   return markers;
 }
 
-// Only text outside existing markers is rewritten, so marker arguments that
-// quote DSML (a grep pattern, a file being written) stay intact. Returns
-// undefined for a truncated DSML block, which would otherwise end the turn
-// silently or let Pi run only the calls before it.
+// Scans left to right and consumes whichever starts first, a marker or a DSML
+// block, so each keeps the other's syntax intact inside its own arguments.
+// Returns undefined for a truncated DSML block, which would otherwise end the
+// turn silently or let Pi run only the calls before it.
 function dsmlToMarkers(text: string): string | undefined {
-  const extraction = isToolCallMarkerResponse(text) ? toolCallMarkers(text) : undefined;
-  const spans = extraction
-    ? [...extraction.markers, ...extraction.invalidSpans].sort((a, b) => a.start - b.start)
-    : [];
   let result = "";
-  let cursor = 0;
-  for (const span of [...spans, { start: text.length, end: text.length }]) {
-    if (span.start < cursor) continue;
-    const outside = text.slice(cursor, span.start);
-    if (DSML_TAG.test(outside.replace(DSML_BLOCK, ""))) return undefined;
-    result += outside.replace(DSML_BLOCK, dsmlBlockToMarkers) + text.slice(span.start, span.end);
-    cursor = span.end;
+  let rest = text;
+  for (;;) {
+    const dsmlAt = rest.search(DSML_TAG);
+    const markerAt = rest.indexOf(MARKER_OPEN);
+    if (dsmlAt < 0) return result + rest;
+    if (markerAt >= 0 && markerAt < dsmlAt) {
+      // The slice starts at the marker, so trimming cannot shift its span.
+      const extraction = toolCallMarkers(rest.slice(markerAt));
+      const span = [...(extraction?.markers ?? []), ...(extraction?.invalidSpans ?? [])].find((s) => s.start === 0);
+      const end = markerAt + (span?.end ?? MARKER_OPEN.length);
+      result += rest.slice(0, end);
+      rest = rest.slice(end);
+      continue;
+    }
+    const block = DSML_BLOCK.exec(rest.slice(dsmlAt));
+    if (!block) return undefined;
+    result += rest.slice(0, dsmlAt) + dsmlBlockToMarkers(block[1]);
+    rest = rest.slice(dsmlAt + block[0].length);
   }
-  return result;
 }
 
 export function parseToolCallResponse(
