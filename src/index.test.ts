@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -1797,6 +1798,78 @@ test("streamOpenCode runs isolated fresh sessions without a Pi session ID", asyn
     }
   } finally {
     rmSync(captureDir, { recursive: true, force: true });
+  }
+});
+
+test("streamOpenCode kills SIGTERM-ignoring children on timeout and abort", async () => {
+  for (const cancel of ["timeout", "abort"] as const) {
+    const controller = new AbortController();
+    const start = Date.now();
+    const abortTimer = cancel === "abort" ? setTimeout(() => controller.abort(), 800) : undefined;
+    try {
+      const message = await withFakeOpenCode(
+        'process.on("SIGTERM", () => {}); setInterval(() => {}, 100); setTimeout(() => process.exit(0), 3000);',
+        () => streamOpenCode(fakeModel(), fakeContext(), {
+          timeoutMs: cancel === "timeout" ? 800 : 5000,
+          signal: controller.signal,
+        }).result(),
+      );
+      assert.equal(message.stopReason, cancel === "abort" ? "aborted" : "error");
+      assert.ok(Date.now() - start < 2000, `${cancel} did not terminate the child within its grace period`);
+    } finally {
+      clearTimeout(abortTimer);
+    }
+  }
+});
+
+test("streamOpenCode turns invalid CLI envelopes into errors without crashing its host", async () => {
+  for (const envelope of [null, [], 42, true, {}, { type: "text", part: null }]) {
+    await withFakeOpenCode(fakeEventScript([envelope]), async () => {
+      const script = `import { streamOpenCode } from ${JSON.stringify(new URL("./index.js", import.meta.url).href)};
+const stream = streamOpenCode(${JSON.stringify(fakeModel())}, { messages: [] });
+const events = []; for await (const event of stream) events.push(event.type);
+console.log(JSON.stringify({ events, message: await stream.result() }));`;
+      const child = spawnSync(process.execPath, ["--input-type=module", "-e", script], {
+        env: process.env, encoding: "utf8", timeout: 5000,
+      });
+      assert.equal(child.status, 0, child.stderr);
+      const result = JSON.parse(child.stdout);
+      assert.deepEqual(result.events, ["start", "error"]);
+      assert.equal(result.message.stopReason, "error");
+      assert.match(result.message.errorMessage, /invalid.*event/i);
+    });
+  }
+});
+
+test("session_shutdown waits for project removal and OpenCode deletion", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "opencode-pi-shutdown-"));
+  const capture = join(dir, "calls.jsonl");
+  const deleted = join(dir, "deleted");
+  const sessionId = "pi-await-shutdown";
+  const previousModels = process.env.OPENCODE_PI_MODELS;
+  process.env.OPENCODE_PI_MODELS = "fake-free";
+  try {
+    await withFakeOpenCode(`if (process.argv.includes("session")) {
+  setTimeout(() => { require("node:fs").writeFileSync(${JSON.stringify(deleted)}, "deleted"); process.exit(0); }, 250);
+} else { ${sessionFakeScript(capture, "ses-await-shutdown")} }`, async () => {
+      let shutdown: (() => Promise<void> | void) | undefined;
+      await opencodePiExtension({
+        registerProvider() {}, registerCommand() {},
+        on(name: string, handler: () => Promise<void> | void) { if (name === "session_shutdown") shutdown = handler; },
+      } as unknown as ExtensionAPI);
+      await streamOpenCode(fakeModel(), userContext(["hello"]), { sessionId }).result();
+      const args = readInvocations(capture)[0]!.args;
+      const project = args[args.indexOf("--dir") + 1]!;
+      assert.equal(existsSync(project), true);
+      assert.ok(shutdown);
+      await shutdown();
+      assert.equal(existsSync(project), false);
+      assert.equal(existsSync(deleted), true);
+    });
+  } finally {
+    restoreEnv("OPENCODE_PI_MODELS", previousModels);
+    await cleanupPiSessionState(sessionId);
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

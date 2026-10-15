@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { runOpenCodeProcess } from "./process.js";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -357,39 +357,10 @@ function runCapture(
   input?: string,
   timeoutMs = DISCOVERY_TIMEOUT_MS,
 ): Promise<{ stdout: string; stderr: string; code: number | null }> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(opencodeBin(), args, {
-      stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
-      env: { ...process.env, OPENCODE_DISABLE_UPDATE_CHECK: "1" },
-    });
-
-    let stdout = "";
-    let stderr = "";
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      reject(new Error(`opencode timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
-
-    child.stdout!.setEncoding("utf8");
-    child.stderr!.setEncoding("utf8");
-    child.stdout!.on("data", (chunk) => {
-      stdout += chunk;
-    });
-    child.stderr!.on("data", (chunk) => {
-      stderr = (stderr + chunk).slice(-STDERR_LIMIT);
-    });
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
-    });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      resolve({ stdout, stderr, code });
-    });
-
-    if (input !== undefined) {
-      child.stdin!.end(input);
-    }
+  return runOpenCodeProcess(opencodeBin(), args, {
+    input,
+    timeoutMs,
+    env: { ...process.env, OPENCODE_DISABLE_UPDATE_CHECK: "1" },
   });
 }
 
@@ -629,6 +600,12 @@ async function writeImageFiles(
       return path;
     }),
   );
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
 }
 
 function safeJson(value: unknown): string {
@@ -1143,24 +1120,16 @@ export function resolveTurnTimeoutMs(timeoutMs: unknown): number {
     : DEFAULT_TURN_TIMEOUT_MS;
 }
 
-/**
- * Best-effort deletion of an OpenCode session record (#71). Fire-and-forget:
- * a failed delete is swallowed so it never fails the turn, and the spawned
- * helper is bounded by its own timeout.
- */
-export function deleteOpenCodeSession(sessionId: string | undefined): void {
-  if (!sessionId) return;
-  try {
-    const child = spawn(opencodeBin(), ["session", "delete", sessionId], {
-      stdio: "ignore",
-      env: { ...process.env, OPENCODE_DISABLE_UPDATE_CHECK: "1" },
-      timeout: SESSION_DELETE_TIMEOUT_MS,
-    });
-    child.on("error", () => undefined);
-    if (typeof child.unref === "function") child.unref();
-  } catch {
-    // Never fail the turn because session cleanup failed.
-  }
+const pendingSessionDeletions = new Set<Promise<void>>();
+
+/** Best-effort, bounded deletion; shutdown also awaits one-shot deletions. */
+export function deleteOpenCodeSession(sessionId: string | undefined): Promise<void> {
+  if (!sessionId) return Promise.resolve();
+  const task = runCapture(["session", "delete", sessionId], undefined, SESSION_DELETE_TIMEOUT_MS)
+    .then(() => undefined, () => undefined);
+  pendingSessionDeletions.add(task);
+  void task.finally(() => pendingSessionDeletions.delete(task));
+  return task;
 }
 
 export type PiSessionState = {
@@ -1226,7 +1195,7 @@ export async function cleanupPiSessionState(
       const state = piSessions.get(id);
       if (!state) return;
       piSessions.delete(id);
-      deleteOpenCodeSession(state.opencodeSessionId);
+      const deletion = deleteOpenCodeSession(state.opencodeSessionId);
       state.opencodeSessionId = undefined;
       if (state.dirPromise) {
         const dirPromise = state.dirPromise;
@@ -1234,8 +1203,10 @@ export async function cleanupPiSessionState(
         const dir = await dirPromise.catch(() => undefined);
         if (dir) await rm(dir, { recursive: true, force: true }).catch(() => undefined);
       }
+      await deletion;
     }),
   );
+  if (piSessionId === undefined) await Promise.all([...pendingSessionDeletions]);
 }
 
 /** Forget a broken session so the next turn starts fresh (#75). */
@@ -1358,8 +1329,6 @@ export function streamOpenCode(
     let opencodeToolUse: string | undefined;
     let opencodeError: string | undefined;
     let finishReason: "stop" | "length" = "stop";
-    let timedOut = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
     // Per-Pi-session reuse key supplied by Pi core (stable for the life of
     // the Pi session). Without it, every turn runs an isolated fresh
     // session in its own temporary directory.
@@ -1434,75 +1403,50 @@ export function streamOpenCode(
       );
       for (const path of imagePaths) args.push("--file", path);
 
-      const child = spawn(opencodeBin(), args, {
-        stdio: ["pipe", "pipe", "pipe"],
-        env: {
-          ...process.env,
-          OPENCODE_DISABLE_UPDATE_CHECK: "1",
-          // Isolate the blocker from the user's global OpenCode plugins while
-          // allowing this project-local safety hook to load.
-          OPENCODE_CONFIG_DIR: join(sessionDir, ".opencode"),
-        },
-      });
-
-      const abort = () => child.kill("SIGTERM");
-      options?.signal?.addEventListener("abort", abort, { once: true });
-      // The timeout is unconditional: a turn is always bounded, even when
-      // Pi supplies no timeoutMs (#73).
-      const turnTimeoutMs = resolveTurnTimeoutMs(options?.timeoutMs);
-      timer = setTimeout(() => {
-        timedOut = true;
-        child.kill("SIGTERM");
-      }, turnTimeoutMs);
-
-      child.stdin!.end(prompt);
-      child.stdout!.setEncoding("utf8");
-      child.stderr!.setEncoding("utf8");
-
-      const handleLine = (line: string) => {
+      const handleLine = async (line: string) => {
         if (!line.trim()) return;
-        let event: any;
+        let parsed: unknown;
         try {
-          event = JSON.parse(line);
+          parsed = JSON.parse(line);
         } catch {
-          stderr = (stderr + `\n${line}`).slice(-STDERR_LIMIT);
-          return;
+          throw new Error("Invalid OpenCode event: malformed JSON");
+        }
+        const event = objectRecord(parsed);
+        const part = objectRecord(event?.part);
+        if (!event || typeof event.type !== "string" ||
+            (event.part !== undefined && !part)) {
+          throw new Error("Invalid OpenCode event envelope");
         }
 
         // Every JSON event carries the OpenCode session ID (#71).
         if (typeof event.sessionID === "string" && event.sessionID) {
           capturedSessionId = event.sessionID;
         } else if (
-          typeof event.part?.sessionID === "string" &&
-          event.part.sessionID
+          typeof part?.sessionID === "string" &&
+          part.sessionID
         ) {
-          capturedSessionId = event.part.sessionID;
+          capturedSessionId = part.sessionID;
         }
 
-        if (event.type === "text" && typeof event.part?.text === "string") {
-          accumulatedText += event.part.text;
-          return;
-        }
-
-        if (
-          event.type === "reasoning" &&
-          typeof event.part?.text === "string"
-        ) {
-          accumulatedThinking += event.part.text;
+        if (event.type === "text" || event.type === "reasoning") {
+          if (typeof part?.text !== "string") throw new Error("Invalid OpenCode event text");
+          if (event.type === "text") accumulatedText += part.text;
+          else accumulatedThinking += part.text;
           return;
         }
 
         if (event.type === "step_finish") {
-          if (/length|max.?tokens/i.test(String(event.part?.reason ?? ""))) {
+          if (/length|max.?tokens/i.test(String(part?.reason ?? ""))) {
             finishReason = "length";
           }
-          if (!event.part?.tokens) return;
-          const tokens = event.part.tokens;
+          const tokens = objectRecord(part?.tokens);
+          if (!tokens) return;
+          const cache = objectRecord(tokens.cache);
           output.usage.input = Number(tokens.input ?? 0);
           output.usage.output =
             Number(tokens.output ?? 0) + Number(tokens.reasoning ?? 0);
-          output.usage.cacheRead = Number(tokens.cache?.read ?? 0);
-          output.usage.cacheWrite = Number(tokens.cache?.write ?? 0);
+          output.usage.cacheRead = Number(cache?.read ?? 0);
+          output.usage.cacheWrite = Number(cache?.write ?? 0);
           output.usage.totalTokens = Number(
             tokens.total ??
               output.usage.input +
@@ -1515,17 +1459,13 @@ export function streamOpenCode(
         }
 
         if (event.type === "tool_use") {
-          opencodeToolUse = event.part?.tool
-            ? String(event.part.tool)
-            : "unknown";
+          opencodeToolUse = part?.tool ? String(part.tool) : "unknown";
           return;
         }
 
         if (event.type === "error") {
-          const message =
-            event.error?.data?.message ??
-            event.error?.message ??
-            event.part?.message;
+          const error = objectRecord(event.error);
+          const message = objectRecord(error?.data)?.message ?? error?.message ?? part?.message;
           opencodeError =
             typeof message === "string" && message.trim()
               ? message.trim()
@@ -1534,36 +1474,25 @@ export function streamOpenCode(
         }
       };
 
-      child.stdout!.on("data", (chunk: string) => {
-        stdoutRemainder += chunk;
-        const lines = stdoutRemainder.split(/\r?\n/);
-        stdoutRemainder = lines.pop() ?? "";
-        for (const line of lines) handleLine(line);
+      const result = await runOpenCodeProcess(opencodeBin(), args, {
+        input: prompt,
+        timeoutMs: resolveTurnTimeoutMs(options?.timeoutMs),
+        signal: options?.signal,
+        env: {
+          ...process.env,
+          OPENCODE_DISABLE_UPDATE_CHECK: "1",
+          OPENCODE_CONFIG_DIR: join(sessionDir, ".opencode"),
+        },
+        onStdout: async (chunk) => {
+          stdoutRemainder += chunk;
+          const lines = stdoutRemainder.split(/\r?\n/);
+          stdoutRemainder = lines.pop() ?? "";
+          for (const line of lines) await handleLine(line);
+        },
       });
-      child.stderr!.on("data", (chunk: string) => {
-        stderr = (stderr + chunk).slice(-STDERR_LIMIT);
-      });
-
-      // The abort listener is detached on every exit path — success,
-      // error, and timeout alike (#72).
-      let code: number | null;
-      try {
-        code = await new Promise<number | null>((resolve, reject) => {
-          child.on("error", reject);
-          child.on("close", resolve);
-        });
-      } finally {
-        options?.signal?.removeEventListener("abort", abort);
-      }
-      if (timer) clearTimeout(timer);
-      if (stdoutRemainder.trim()) handleLine(stdoutRemainder);
-
-      if (options?.signal?.aborted) {
-        throw new Error("Request was aborted");
-      }
-      if (timedOut) {
-        throw new Error(`opencode timed out after ${turnTimeoutMs}ms`);
-      }
+      const { code } = result;
+      stderr = (stderr + result.stderr).slice(-STDERR_LIMIT);
+      if (stdoutRemainder.trim()) await handleLine(stdoutRemainder);
       if (code !== 0) {
         throw new Error(stderr.trim() || `opencode exited with code ${code}`);
       }
@@ -1720,7 +1649,6 @@ export function streamOpenCode(
       stream.push({ type: "done", reason: finishReason, message: output });
       stream.end();
     } catch (error) {
-      if (timer) clearTimeout(timer);
       // Any error, timeout, or abort drops the session ID so the next turn
       // starts fresh with the full transcript; the failed session record is
       // deleted best-effort and never fails the turn (#71, #75).
@@ -1737,7 +1665,6 @@ export function streamOpenCode(
       stream.push({ type: "error", reason: output.stopReason, error: output });
       stream.end();
     } finally {
-      if (timer) clearTimeout(timer);
       // Only one-shot turns own their directory. Per-Pi-session directories
       // persist for reuse and are removed at session teardown (#74).
       if (tempDir) {
@@ -1830,9 +1757,7 @@ export default async function opencodePiExtension(pi: ExtensionAPI) {
 
   // Tear down per-Pi-session OpenCode state — project directories and
   // session records — when the Pi session ends for any reason (#74).
-  pi.on("session_shutdown", () => {
-    void cleanupPiSessionState();
-  });
+  pi.on("session_shutdown", () => cleanupPiSessionState());
 
   pi.on("session_start", async (_event: any, ctx: any) => {
     const cliStatus = await checkCliStatus();

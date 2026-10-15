@@ -6,6 +6,7 @@
   "main": "./src/index.ts",
   "files": [
     "src/index.ts",
+    "src/process.ts",
     "README.md",
     "LICENSE",
     "SECURITY.md"
@@ -13,7 +14,7 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --test --test-timeout=30000 dist/index.test.js",
+    "test": "npm run build && node --test --test-timeout=30000 dist/index.test.js dist/process.test.js",
     "prepublishOnly": "npm run typecheck && npm test"
   },
   "pi": {
