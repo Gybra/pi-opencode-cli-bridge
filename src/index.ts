@@ -1415,7 +1415,9 @@ export function streamOpenCode(
         try {
           parsed = JSON.parse(line);
         } catch {
-          throw new Error("Invalid OpenCode event: malformed JSON");
+          // Plugins share OpenCode's stdout; keep stray log lines as diagnostics.
+          stderr = (stderr + `\n${line}`).slice(-STDERR_LIMIT);
+          return;
         }
         const event = objectRecord(parsed);
         const part = objectRecord(event?.part);

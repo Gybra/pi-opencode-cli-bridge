@@ -1917,6 +1917,15 @@ test("streamOpenCode kills SIGTERM-ignoring children on timeout and abort", asyn
   }
 });
 
+test("streamOpenCode treats non-JSON stdout lines as diagnostics, not failed turns", async () => {
+  const message = await withFakeOpenCode(
+    `process.stdout.write("[my-plugin] loaded\\n" + JSON.stringify({ type: "text", part: { text: "ok" } }) + "\\n");`,
+    () => streamOpenCode(fakeModel(), fakeContext()).result(),
+  );
+  assert.equal(message.stopReason, "stop");
+  assert.deepEqual(message.content, [{ type: "text", text: "ok" }]);
+});
+
 test("streamOpenCode turns invalid CLI envelopes into errors without crashing its host", async () => {
   for (const envelope of [null, [], 42, true, {}, { type: "text", part: null }]) {
     await withFakeOpenCode(fakeEventScript([envelope]), async () => {
