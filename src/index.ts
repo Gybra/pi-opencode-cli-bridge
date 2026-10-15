@@ -1413,6 +1413,14 @@ async function createTempAgentDir(): Promise<string> {
   const pluginsDir = join(configDir, "plugins");
   await mkdir(agentsDir, { recursive: true });
   await mkdir(pluginsDir, { recursive: true });
+  // `opencode run` streams an OpenCode compaction summary as reply text, where
+  // its quoted markers break the turn. Pi owns compaction, so overflow must
+  // surface as an error instead.
+  await writeFile(
+    join(configDir, "opencode.json"),
+    JSON.stringify({ compaction: { auto: false } }),
+    "utf8",
+  );
   await writeFile(
     join(agentsDir, `${AGENT_ID}.md`),
     `---

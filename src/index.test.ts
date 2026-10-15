@@ -2170,6 +2170,13 @@ test("provider environment reaches the CLI without replacing mandatory bridge co
   assert.deepEqual(message.content, [{ type: "text", text: "scoped|true" }]);
 });
 
+test("OpenCode never compacts the session itself", async () => {
+  // Its summary would reach Pi as reply text; Pi owns compaction.
+  const message = await withFakeOpenCode(`const c = require("node:fs").readFileSync(process.env.OPENCODE_CONFIG_DIR + "/opencode.json", "utf8"); process.stdout.write(JSON.stringify({type:"text",part:{text:String(JSON.parse(c).compaction.auto)}}) + "\\n");`, () =>
+    streamOpenCode(fakeModel(), fakeContext()).result());
+  assert.deepEqual(message.content, [{ type: "text", text: "false" }]);
+});
+
 test("streamOpenCode kills SIGTERM-ignoring children on timeout and abort", async () => {
   for (const cancel of ["timeout", "abort"] as const) {
     const controller = new AbortController();
