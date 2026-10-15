@@ -849,6 +849,18 @@ test("streamOpenCode diagnoses broken calls in reasoning instead of ending the t
   assert.match(message.errorMessage ?? "", /incomplete DeepSeek DSML tool call/);
 });
 
+test("streamOpenCode diagnoses a truncated marker in reasoning instead of ending the turn", async () => {
+  const message = await withFakeOpenCode(
+    fakeEventScript([
+      { type: "reasoning", part: { text: '<pi_tool_call>{"name":"bash","arguments":{"command":"ls"' } },
+    ]),
+    () => streamOpenCode(fakeModel(), fakeContext(["bash"])).result(),
+  );
+
+  assert.equal(message.stopReason, "error");
+  assert.match(message.errorMessage ?? "", /malformed Pi tool-call markers/);
+});
+
 test("streamOpenCode diagnoses an unclosed DSML tool call instead of ending the turn", async () => {
   const message = await withFakeOpenCode(
     fakeEventScript([

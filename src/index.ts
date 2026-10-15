@@ -1714,10 +1714,14 @@ export function streamOpenCode(
       // DeepSeek sometimes writes its only calls in the reasoning and replies
       // with nothing, which would end the turn silently.
       if (textCalls.length === 0 && !nativeCalls && !displayText.trim()) {
-        const reasoningResult = parseToolCallResponse(
+        let reasoningResult = parseToolCallResponse(
           accumulatedThinking,
           allowedToolNames,
         );
+        // Markers stripped with no call surviving were meant as calls too.
+        if (reasoningResult.ok && reasoningResult.calls.length === 0 && reasoningResult.cleanedText !== undefined) {
+          reasoningResult = { ok: false, rejection: { reason: "malformed_markers" } };
+        }
         if (!reasoningResult.ok) {
           throw new Error(
             toolCallRejectionMessage(reasoningResult, allowedToolNames),
