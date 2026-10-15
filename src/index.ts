@@ -948,10 +948,52 @@ function stripMarkerSpans(text: string, spans: MarkerSpan[]): string {
   return cleaned;
 }
 
+// DeepSeek sometimes ignores the markers and writes its native DSML tool-call
+// syntax as plain text; its invoke/parameter blocks map one-to-one onto Pi calls.
+const DSML = String.raw`[｜|]+\s*DSML\s*[｜|]+`;
+const DSML_BLOCK = new RegExp(String.raw`<${DSML}(?:tool|function)_calls>([\s\S]*?)<\/${DSML}(?:tool|function)_calls>`, "g");
+const DSML_INVOKE = new RegExp(String.raw`<${DSML}invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/${DSML}invoke>`, "g");
+const DSML_PARAMETER = new RegExp(String.raw`<${DSML}parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>([\s\S]*?)<\/${DSML}parameter>`, "g");
+const DSML_INVOKE_NAME = new RegExp(String.raw`<${DSML}invoke\s+name="([^"]+)"`);
+
+function parseDsmlToolCalls(text: string): { calls: ParsedToolCall[]; cleanedText: string } | undefined {
+  const calls: ParsedToolCall[] = [];
+  const cleanedText = text.replace(DSML_BLOCK, (_block, body: string) => {
+    for (const [, name, params] of body.matchAll(DSML_INVOKE)) {
+      const args: Record<string, unknown> = {};
+      for (const [, key, isString, raw] of params.matchAll(DSML_PARAMETER)) {
+        if (isString === "true") {
+          args[key] = raw;
+          continue;
+        }
+        try {
+          args[key] = JSON.parse(raw);
+        } catch {
+          args[key] = raw;
+        }
+      }
+      calls.push({ name, arguments: args });
+    }
+    return "";
+  });
+  return calls.length > 0 ? { calls, cleanedText } : undefined;
+}
+
 export function parseToolCallResponse(
   text: string,
   allowedToolNames?: ReadonlySet<string>,
 ): ToolCallParseResult {
+  const dsml = parseDsmlToolCalls(text);
+  if (dsml) {
+    const unavailable = dsml.calls.find((call) => allowedToolNames && !allowedToolNames.has(call.name));
+    if (unavailable) {
+      return { ok: false, rejection: { reason: "unavailable_tool", toolName: unavailable.name } };
+    }
+    const rest = parseToolCallResponse(dsml.cleanedText, allowedToolNames);
+    if (!rest.ok) return rest;
+    return { ok: true, calls: [...dsml.calls, ...rest.calls], cleanedText: rest.cleanedText ?? dsml.cleanedText };
+  }
+
   const normalizedText = normalizeQuotedToolCallResponse(text);
   if (!isToolCallMarkerResponse(normalizedText)) return { ok: true, calls: [] };
 
@@ -1019,7 +1061,7 @@ function detectXmlToolUse(text: string): string | undefined {
   // Claude Code uses <bash>, <read>, <edit>, etc. directly, but may also
   // emit <arg_key>/<arg_value> pairs inside those tags.
   const xmlToolPattern = /<(bash|read|edit|write|glob|grep|ls|webfetch|websearch|task|todowrite|question|skill|lsp|external_directory|doom_loop|agent|arg_key|arg_value)\b/i;
-  const match = text.match(xmlToolPattern);
+  const match = text.match(xmlToolPattern) ?? text.match(DSML_INVOKE_NAME);
   return match ? match[1].toLowerCase() : undefined;
 }
 
