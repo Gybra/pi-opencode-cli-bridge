@@ -534,6 +534,16 @@ test("parseToolCallResponse keeps DSML and marker calls in response order", () =
   const tools = new Set(["read", "write"]);
   assert.deepEqual(parseToolCalls(write + read, tools).map((call) => call.name), ["write", "read"]);
   assert.deepEqual(parseToolCalls(read + write, tools).map((call) => call.name), ["read", "write"]);
+  assert.deepEqual(parseToolCalls(`\n  ${read}\n${write}`, tools).map((call) => call.name), ["read", "write"]);
+});
+
+test("parseToolCallResponse leaves marker text inside DSML arguments untouched", () => {
+  const command = "rg '<pi_tool_call>' src/index.ts";
+  const response =
+    `<｜DSML｜tool_calls><｜DSML｜invoke name="bash"><｜DSML｜parameter name="command" string="true">${command}</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>`;
+  assert.deepEqual(parseToolCalls(response, new Set(["bash"])), [
+    { name: "bash", arguments: { command } },
+  ]);
 });
 
 test("parseToolCallResponse leaves DSML text inside marker arguments untouched", () => {
