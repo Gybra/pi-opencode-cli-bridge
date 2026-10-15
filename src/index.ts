@@ -2,7 +2,7 @@ import { runOpenCodeProcess } from "./process.js";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, join, posix, win32 } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerApiProvider } from "@earendil-works/pi-ai/compat";
 import {
@@ -619,6 +619,7 @@ export function translateNativeToolCall(
   input: unknown,
   allowedToolNames: Set<string>,
   projectDirs: string[],
+  paths: typeof posix = process.platform === "win32" ? win32 : posix,
 ): ParsedToolCall | undefined {
   const args = objectRecord(input);
   if (!args) return undefined;
@@ -626,10 +627,15 @@ export function translateNativeToolCall(
   const count = (key: string) =>
     typeof args[key] === "number" && args[key] > 0 ? args[key] as number : undefined;
   // OpenCode resolves paths in its temporary project; Pi resolves them in the real one.
+  // Platform path rules also cover Windows slash and drive-letter case differences.
   const path = (key: string) => {
     const value = text(key);
-    const dir = value && projectDirs.find((d) => value === d || value.startsWith(d + sep));
-    return dir ? relative(dir, value) || "." : value;
+    if (value === undefined || !paths.isAbsolute(value)) return value;
+    for (const dir of projectDirs) {
+      const rel = paths.relative(dir, value);
+      if (rel !== ".." && !rel.startsWith(".." + paths.sep) && !paths.isAbsolute(rel)) return rel || ".";
+    }
+    return value;
   };
   const call = (name: string, entries: Record<string, unknown>): ParsedToolCall => ({
     name,

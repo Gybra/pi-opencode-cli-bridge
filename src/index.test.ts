@@ -9,19 +9,30 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, win32 } from "node:path";
 import test from "node:test";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  createBashToolDefinition,
+  createEditToolDefinition,
+  createFindToolDefinition,
+  createGrepToolDefinition,
+  createReadToolDefinition,
+  createWriteToolDefinition,
+  type ExtensionAPI,
+} from "@earendil-works/pi-coding-agent";
 import {
   resetApiProviders as clearApiProviders,
   getApiProvider,
 } from "@earendil-works/pi-ai/compat";
+import { validateToolArguments } from "@earendil-works/pi-ai";
 import type {
   Api,
   AssistantMessageEvent,
   Context,
   Message,
   Model,
+  Tool,
+  ToolCall,
 } from "@earendil-works/pi-ai";
 import opencodePiExtension, {
   cleanupPiSessionState,
@@ -717,18 +728,36 @@ test("streamOpenCode rejects native OpenCode tool use with marker remediation", 
   );
 });
 
-test("translateNativeToolCall maps blocked OpenCode calls onto equivalent Pi tools", () => {
+const piToolDefinitions = [
+  createBashToolDefinition, createReadToolDefinition, createWriteToolDefinition,
+  createEditToolDefinition, createGrepToolDefinition, createFindToolDefinition,
+].map((create) => create(process.cwd()));
+
+/** Pi accepts extra properties, so also reject keys its real schema does not declare. */
+function assertPiAccepts(call: ReturnType<typeof translateNativeToolCall>) {
+  assert.ok(call, "call was not translated");
+  const definition = piToolDefinitions.find((d) => d.name === call.name);
+  assert.ok(definition, `no Pi tool named ${call.name}`);
+  validateToolArguments(definition as unknown as Tool, { type: "toolCall", id: "t", name: call.name, arguments: call.arguments as ToolCall["arguments"] });
+  const declared = Object.keys((definition.parameters as { properties: object }).properties);
+  for (const key of Object.keys(call.arguments)) assert.ok(declared.includes(key), `${call.name} has no ${key}`);
+  return call;
+}
+
+test("translateNativeToolCall maps blocked OpenCode calls onto arguments Pi's real tools accept", () => {
   const all = new Set(["bash", "read", "write", "edit", "grep", "find"]);
   const dirs = ["/tmp/oc-project", "/private/tmp/oc-project"];
   const t = (tool: string, input: unknown, allowed = all) => translateNativeToolCall(tool, input, allowed, dirs);
-  assert.deepEqual(t("bash", { command: "ls", description: "List", timeout: 1500 }), { name: "bash", arguments: { command: "ls", timeout: 2 } });
-  assert.deepEqual(t("bash", { command: "ls", workdir: "/tmp/oc-project" }), { name: "bash", arguments: { command: "ls" } });
-  assert.deepEqual(t("read", { filePath: "/private/tmp/oc-project/src/a.ts", offset: 3, limit: 10 }), { name: "read", arguments: { path: "src/a.ts", offset: 3, limit: 10 } });
-  assert.deepEqual(t("read", { filePath: "/etc/hosts" }), { name: "read", arguments: { path: "/etc/hosts" } });
-  assert.deepEqual(t("write", { filePath: "/tmp/oc-project/n.txt", content: "x" }), { name: "write", arguments: { path: "n.txt", content: "x" } });
-  assert.deepEqual(t("edit", { filePath: "a.ts", oldString: "a", newString: "b" }), { name: "edit", arguments: { path: "a.ts", edits: [{ oldText: "a", newText: "b" }] } });
-  assert.deepEqual(t("grep", { pattern: "x", path: "/tmp/oc-project", include: "*.ts" }), { name: "grep", arguments: { pattern: "x", path: ".", glob: "*.ts" } });
-  assert.deepEqual(t("glob", { pattern: "**/*.ts" }), { name: "find", arguments: { pattern: "**/*.ts" } });
+  const ok = (tool: string, input: unknown) => assertPiAccepts(t(tool, input));
+  assert.deepEqual(ok("bash", { command: "ls", description: "List", timeout: 1500 }), { name: "bash", arguments: { command: "ls", timeout: 2 } });
+  assert.deepEqual(ok("bash", { command: "ls", workdir: "/tmp/oc-project" }), { name: "bash", arguments: { command: "ls" } });
+  assert.deepEqual(ok("read", { filePath: "/private/tmp/oc-project/src/a.ts", offset: 3, limit: 10 }), { name: "read", arguments: { path: "src/a.ts", offset: 3, limit: 10 } });
+  assert.deepEqual(ok("read", { filePath: "/etc/hosts" }), { name: "read", arguments: { path: "/etc/hosts" } });
+  assert.deepEqual(ok("read", { filePath: "/tmp/oc-project-other/a.ts" }), { name: "read", arguments: { path: "/tmp/oc-project-other/a.ts" } });
+  assert.deepEqual(ok("write", { filePath: "/tmp/oc-project/n.txt", content: "x" }), { name: "write", arguments: { path: "n.txt", content: "x" } });
+  assert.deepEqual(ok("edit", { filePath: "a.ts", oldString: "a", newString: "b" }), { name: "edit", arguments: { path: "a.ts", edits: [{ oldText: "a", newText: "b" }] } });
+  assert.deepEqual(ok("grep", { pattern: "x", path: "/tmp/oc-project", include: "*.ts" }), { name: "grep", arguments: { pattern: "x", path: ".", glob: "*.ts" } });
+  assert.deepEqual(ok("glob", { pattern: "**/*.ts", path: "src" }), { name: "find", arguments: { pattern: "**/*.ts", path: "src" } });
   // Different semantics, missing Pi tools or malformed input stay untranslated.
   assert.equal(t("edit", { filePath: "a.ts", oldString: "a", newString: "b", replaceAll: true }), undefined);
   assert.equal(t("edit", { filePath: "a.ts", oldString: "", newString: "b" }), undefined);
@@ -737,6 +766,15 @@ test("translateNativeToolCall maps blocked OpenCode calls onto equivalent Pi too
   assert.equal(t("webfetch", { url: "https://example.com" }), undefined);
   assert.equal(t("bash", { command: "ls" }, new Set(["read"])), undefined);
   assert.equal(t("read", null), undefined);
+});
+
+test("translateNativeToolCall recognizes Windows temp-project paths regardless of slashes and case", () => {
+  const dirs = ["C:\\Users\\Me\\AppData\\Local\\Temp\\opencode-pi-1"];
+  const t = (input: unknown, tool = "read") => translateNativeToolCall(tool, input, new Set(["read", "bash"]), dirs, win32);
+  assert.deepEqual(t({ filePath: "c:/users/me/appdata/local/temp/opencode-pi-1/src/a.ts" }), { name: "read", arguments: { path: "src\\a.ts" } });
+  assert.deepEqual(t({ filePath: "C:\\Users\\Me\\AppData\\Local\\Temp\\opencode-pi-1\\a.ts" }), { name: "read", arguments: { path: "a.ts" } });
+  assert.deepEqual(t({ filePath: "D:/repo/a.ts" }), { name: "read", arguments: { path: "D:/repo/a.ts" } });
+  assert.deepEqual(t({ command: "dir", workdir: "C:/Users/Me/AppData/Local/Temp/opencode-pi-1/" }, "bash"), { name: "bash", arguments: { command: "dir" } });
 });
 
 test("streamOpenCode turns a translatable native step into Pi tool calls and stops OpenCode", async () => {
