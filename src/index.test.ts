@@ -1801,6 +1801,101 @@ test("streamOpenCode runs isolated fresh sessions without a Pi session ID", asyn
   }
 });
 
+test("provider hooks await ordered observations and replace the actual CLI prompt", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-hooks-"));
+  const capture = join(dir, "calls.jsonl");
+  const order: string[] = [];
+  const pause = () => new Promise((resolve) => setTimeout(resolve, 5));
+  try {
+    const message = await withFakeOpenCode(sessionFakeScript(capture, "ses-hooks"), () =>
+      streamOpenCode(fakeModel(), userContext(["original"]), {
+        onPayload: async (payload, model) => {
+          assert.equal(model.id, "opencode/fake-free");
+          assert.match((payload as { prompt: string }).prompt, /original/);
+          order.push("payload"); await pause(); return { prompt: "replacement" };
+        },
+        onResponse: async (response) => {
+          assert.equal(response.status, 0);
+          assert.equal(response.headers["x-pi-transport"], "opencode-cli");
+          order.push("response"); await pause(); order.push("response-done");
+        },
+        onProviderStreamEvent: async (event) => {
+          const type = (event as { type: string }).type;
+          order.push(type); await pause(); order.push(type + "-done");
+        },
+      }).result());
+    assert.equal(message.stopReason, "stop");
+    assert.equal(readInvocations(capture)[0]?.stdin, "replacement");
+    assert.deepEqual(order, ["payload", "response", "response-done", "text", "text-done", "step_finish", "step_finish-done"]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("provider hooks reject invalid payloads and contain callback failures", async () => {
+  for (const payload of [null, "bad", { prompt: 42 }]) {
+    const message = await withFakeOpenCode(fakeEventScript([{ type: "text", part: { text: "ok" } }]), () =>
+      streamOpenCode(fakeModel(), fakeContext(), { onPayload: () => payload }).result());
+    assert.equal(message.stopReason, "error");
+    assert.match(message.errorMessage ?? "", /payload.*prompt/i);
+  }
+  for (const hook of ["onPayload", "onResponse", "onProviderStreamEvent"] as const) {
+    const message = await withFakeOpenCode(fakeEventScript([{ type: "text", part: { text: "ok" } }]), () =>
+      streamOpenCode(fakeModel(), fakeContext(), {
+        [hook]: async () => { throw new Error("callback failed"); },
+      }).result());
+    assert.equal(message.stopReason, "error");
+    assert.equal(message.errorMessage, "callback failed");
+  }
+});
+
+test("provider hooks remain cancellable during payload, response and unterminated final events", async () => {
+  for (const hook of ["onPayload", "onResponse", "onProviderStreamEvent"] as const) {
+    const controller = new AbortController();
+    let entered = false;
+    const start = Date.now();
+    const message = await withFakeOpenCode('process.stdout.write(JSON.stringify({type:"text",part:{text:"ok"}}));', () =>
+      streamOpenCode(fakeModel(), fakeContext(), {
+        signal: controller.signal, timeoutMs: 1000,
+        [hook]: async () => {
+          entered = true; controller.abort(); await new Promise(() => {});
+        },
+      }).result());
+    assert.equal(entered, true, hook);
+    assert.equal(message.stopReason, "aborted");
+    assert.ok(Date.now() - start < 2000);
+  }
+});
+
+test("provider payload transformations start fresh instead of reusing stale session context", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-hooks-reuse-"));
+  const capture = join(dir, "calls.jsonl");
+  const sessionId = "pi-payload-session";
+  try {
+    await withFakeOpenCode(sessionFakeScript(capture, "ses-payload"), async () => {
+      for (const contexts of [userContext(["first question"]), conversationContext()]) {
+        const message = await streamOpenCode(fakeModel(), contexts, {
+          sessionId, onPayload: (payload) => payload,
+        }).result();
+        assert.equal(message.stopReason, "stop");
+      }
+      const calls = readInvocations(capture);
+      assert.equal(calls.length, 2);
+      assert.equal(calls[1]!.args.includes("--session"), false);
+      assert.match(calls[1]!.stdin, /first question/);
+      await cleanupPiSessionState(sessionId);
+    });
+  } finally {
+    await cleanupPiSessionState(sessionId);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("provider environment reaches the CLI without replacing mandatory bridge configuration", async () => {
+  const message = await withFakeOpenCode(`process.stdout.write(JSON.stringify({type:"text",part:{text:process.env.PI_BRIDGE_TEST + "|" + process.env.OPENCODE_CONFIG_DIR.endsWith(".opencode")}}) + "\\n");`, () =>
+    streamOpenCode(fakeModel(), fakeContext(), { env: { PI_BRIDGE_TEST: "scoped", OPENCODE_CONFIG_DIR: "/wrong" } }).result());
+  assert.equal(message.stopReason, "stop");
+  assert.deepEqual(message.content, [{ type: "text", text: "scoped|true" }]);
+});
+
 test("streamOpenCode kills SIGTERM-ignoring children on timeout and abort", async () => {
   for (const cancel of ["timeout", "abort"] as const) {
     const controller = new AbortController();

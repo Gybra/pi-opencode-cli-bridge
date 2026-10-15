@@ -111,6 +111,13 @@ Without an override, discovery selects active models whose reported input and ou
 5. Text markers such as `<pi_tool_call>{"name":"read","arguments":{"path":"example.txt"}}</pi_tool_call>` become Pi tool calls. Tool names must be in the current Pi tool list; execution then follows Pi's normal validation and permission pipeline.
 6. Successful continuation turns reuse an OpenCode session and send only the new transcript. Changes to the model, prompt, tools or transcript prefix start a fresh session.
 
+Pi's provider instrumentation hooks follow the CLI transport, not OpenCode's internal HTTP traffic:
+
+- `onPayload` receives `{ prompt }`, the exact text written to the CLI's standard input. Returning `{ prompt: "..." }` replaces it; any other non-`undefined` value fails the turn. A turn with a payload hook always starts a fresh OpenCode session.
+- `onResponse` is called once the subprocess has started, with `status: 0` (no HTTP status exists) and the header `x-pi-transport: opencode-cli`.
+- `onProviderStreamEvent` receives each validated `--format json` event in order, and is awaited before the event is processed.
+- Provider-scoped `env` values are passed to the subprocess. The bridge's own configuration directory and update-check settings always take precedence.
+
 Reasoning variants, image support and token limits follow CLI discovery. Token usage is taken from CLI events when available, otherwise estimated. Session records and temporary project directories are cleaned up on a best-effort basis.
 
 ## Security, privacy and limits

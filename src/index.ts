@@ -1354,14 +1354,16 @@ export function streamOpenCode(
       // session only when the model, tools, system prompt, and transcript
       // prefix all still match. Any drift restarts fresh — and the stale
       // session record is deleted so it cannot leak.
-      let delta = piState
+      // A payload hook may rewrite the prompt, so its session cannot be continued as a transcript prefix.
+      const payloadHook = options?.onPayload;
+      let delta = piState && !payloadHook
         ? continuationDelta(piState, model.id, context, transcriptParts)
         : undefined;
       if (piState && piState.opencodeSessionId && delta === undefined) {
         dropOpencodeSession(piState);
       }
       const isContinuation = delta !== undefined;
-      const prompt = isContinuation
+      let prompt = isContinuation
         ? buildContinuationPrompt(delta)
         : buildPrompt(context);
       const sentMessages = isContinuation
@@ -1417,6 +1419,7 @@ export function streamOpenCode(
             (event.part !== undefined && !part)) {
           throw new Error("Invalid OpenCode event envelope");
         }
+        await options?.onProviderStreamEvent?.(event, model);
 
         // Every JSON event carries the OpenCode session ID (#71).
         if (typeof event.sessionID === "string" && event.sessionID) {
@@ -1475,11 +1478,26 @@ export function streamOpenCode(
       };
 
       const result = await runOpenCodeProcess(opencodeBin(), args, {
-        input: prompt,
+        input: async () => {
+          if (!payloadHook) return prompt;
+          const replacement = await payloadHook({ prompt }, model);
+          if (replacement === undefined) return prompt;
+          const payload = objectRecord(replacement);
+          if (typeof payload?.prompt !== "string") {
+            throw new Error("OpenCode CLI payload must be an object with a string prompt");
+          }
+          return (prompt = payload.prompt);
+        },
+        // A CLI subprocess has no HTTP status; 0 marks the non-HTTP transport.
+        onStart: () => options?.onResponse?.(
+          { status: 0, headers: { "x-pi-transport": "opencode-cli" } },
+          model,
+        ),
         timeoutMs: resolveTurnTimeoutMs(options?.timeoutMs),
         signal: options?.signal,
         env: {
           ...process.env,
+          ...options?.env,
           OPENCODE_DISABLE_UPDATE_CHECK: "1",
           OPENCODE_CONFIG_DIR: join(sessionDir, ".opencode"),
         },
@@ -1489,10 +1507,10 @@ export function streamOpenCode(
           stdoutRemainder = lines.pop() ?? "";
           for (const line of lines) await handleLine(line);
         },
+        onEnd: () => handleLine(stdoutRemainder),
       });
       const { code } = result;
       stderr = (stderr + result.stderr).slice(-STDERR_LIMIT);
-      if (stdoutRemainder.trim()) await handleLine(stdoutRemainder);
       if (code !== 0) {
         throw new Error(stderr.trim() || `opencode exited with code ${code}`);
       }
@@ -1561,7 +1579,7 @@ export function streamOpenCode(
       );
       // The turn succeeded: record the session for reuse, or delete the
       // one-shot session record so it cannot accumulate (#71, #75).
-      if (piState) {
+      if (piState && !payloadHook) {
         piState.opencodeSessionId =
           capturedSessionId ?? piState.opencodeSessionId;
         piState.modelId = model.id;

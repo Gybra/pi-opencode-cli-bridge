@@ -3,11 +3,12 @@ import { once } from "node:events";
 
 export type ProcessOptions = {
   timeoutMs: number;
-  input?: string;
+  input?: string | (() => string | Promise<string>);
   env?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
   onStart?: () => void | Promise<void>;
   onStdout?: (chunk: string) => void | Promise<void>;
+  onEnd?: () => void | Promise<void>;
 };
 
 /** Own the child, its pipes and cancellation, including async consumer failures. */
@@ -73,13 +74,16 @@ export async function runOpenCodeProcess(
   );
   const consume = async () => {
     await once(child, "spawn");
+    const input = typeof options.input === "function" ? await options.input() : options.input;
+    if (failure) throw failure;
     await options.onStart?.();
     if (failure) throw failure;
-    child.stdin.end(options.input);
+    child.stdin.end(input);
     for await (const chunk of child.stdout) {
       if (options.onStdout) await options.onStdout(String(chunk));
       else stdout += chunk;
     }
+    await options.onEnd?.();
     const code = await closed;
     if (failure) throw failure;
     return { stdout, stderr, code };
