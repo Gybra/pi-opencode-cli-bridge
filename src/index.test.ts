@@ -1216,6 +1216,7 @@ test("session_start produces no warning when opencode answers --version", async 
 
   try {
     const recorder = sessionStartRecorder();
+    const ctx = recordingCtx();
     await withFakeOpenCode(
       `if (process.argv.includes("--version")) {
   process.stdout.write("opencode 9.9.9\\n");
@@ -1225,11 +1226,11 @@ process.stdout.write([
   "opencode/one-free",
   JSON.stringify({ capabilities: {} }),
 ].join("\\n"));`,
-      () => opencodePiExtension(recorder.extension),
+      async () => {
+        await opencodePiExtension(recorder.extension);
+        await recorder.run(ctx);
+      },
     );
-
-    const ctx = recordingCtx();
-    await recorder.run(ctx);
 
     assert.deepEqual(
       ctx.notifications.filter((n) => n.level === "warning"),

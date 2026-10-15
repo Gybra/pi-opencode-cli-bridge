@@ -86,7 +86,7 @@ This fork now uses a distinct package identity, Node 22.19+ and documented Pi 1.
 ## Verification and limits
 
 - Prior regression cycle: the three transcript/error-preparation tests failed before the compatibility fix, then passed after it.
-- Full existing suite: 69 tests passed on the local Node 22.19.0 runtime before this packaging pass. Fresh-install verification is recorded with the fork's packaging commit.
+- Packaging verification: a fresh `npm ci`, typechecking and all 69 tests passed on Node 22.19.0. The first CI run exposed an inherited lifecycle test that restored the real CLI before invoking its handler; that fixture scope is now corrected. The targeted test and the full 69-test suite also pass with `OPENCODE_PI_BIN` forced to a nonexistent executable, so this verification does not depend on a locally installed OpenCode CLI.
 - Live macOS checks: DeepSeek v4.1 Flash Free returned `OK`, and a Pi `read` tool call read a fresh test file and returned its exact contents. Both used thinking off.
 - Review probes reproduced findings 1 and 2 in isolated Node processes and demonstrated the missing callbacks in finding 4. Test processes and files were bounded and isolated from personal data.
 - Not checked: real-model behavior on Linux or Windows, OpenCode 2.x, high-thinking reliability, adversarial native-tool execution, provider legal compliance or upstream service internals.
