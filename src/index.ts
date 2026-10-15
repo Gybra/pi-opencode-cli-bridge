@@ -100,6 +100,7 @@ export type ToolCallParseResult =
       rejection:
         | { reason: "malformed_markers" }
         | { reason: "invalid_payload" }
+        | { reason: "incomplete_dsml" }
         | { reason: "unavailable_tool"; toolName: string };
     };
 
@@ -949,16 +950,17 @@ function stripMarkerSpans(text: string, spans: MarkerSpan[]): string {
 }
 
 // DeepSeek sometimes ignores the markers and writes its native DSML tool-call
-// syntax as plain text; its invoke/parameter blocks map one-to-one onto Pi calls.
+// syntax as plain text. Each complete block is rewritten in place as markers,
+// so call order and the tool-list check stay those of the marker parser.
 const DSML = String.raw`[｜|]+\s*DSML\s*[｜|]+`;
+const DSML_TAG = new RegExp(String.raw`<\/?${DSML}`);
 const DSML_BLOCK = new RegExp(String.raw`<${DSML}(?:tool|function)_calls>([\s\S]*?)<\/${DSML}(?:tool|function)_calls>`, "g");
 const DSML_INVOKE = new RegExp(String.raw`<${DSML}invoke\s+name="([^"]+)"\s*>([\s\S]*?)<\/${DSML}invoke>`, "g");
 const DSML_PARAMETER = new RegExp(String.raw`<${DSML}parameter\s+name="([^"]+)"(?:\s+string="(true|false)")?\s*>([\s\S]*?)<\/${DSML}parameter>`, "g");
-const DSML_INVOKE_NAME = new RegExp(String.raw`<${DSML}invoke\s+name="([^"]+)"`);
 
-function parseDsmlToolCalls(text: string): { calls: ParsedToolCall[]; cleanedText: string } | undefined {
-  const calls: ParsedToolCall[] = [];
-  const cleanedText = text.replace(DSML_BLOCK, (_block, body: string) => {
+function dsmlToMarkers(text: string): string {
+  return text.replace(DSML_BLOCK, (_block, body: string) => {
+    let markers = "";
     for (const [, name, params] of body.matchAll(DSML_INVOKE)) {
       const args: Record<string, unknown> = {};
       for (const [, key, isString, raw] of params.matchAll(DSML_PARAMETER)) {
@@ -972,29 +974,22 @@ function parseDsmlToolCalls(text: string): { calls: ParsedToolCall[]; cleanedTex
           args[key] = raw;
         }
       }
-      calls.push({ name, arguments: args });
+      markers += `${MARKER_OPEN}${JSON.stringify({ name, arguments: args })}</pi_tool_call>`;
     }
-    return "";
+    return markers;
   });
-  return calls.length > 0 ? { calls, cleanedText } : undefined;
 }
 
 export function parseToolCallResponse(
   text: string,
   allowedToolNames?: ReadonlySet<string>,
 ): ToolCallParseResult {
-  const dsml = parseDsmlToolCalls(text);
-  if (dsml) {
-    const unavailable = dsml.calls.find((call) => allowedToolNames && !allowedToolNames.has(call.name));
-    if (unavailable) {
-      return { ok: false, rejection: { reason: "unavailable_tool", toolName: unavailable.name } };
-    }
-    const rest = parseToolCallResponse(dsml.cleanedText, allowedToolNames);
-    if (!rest.ok) return rest;
-    return { ok: true, calls: [...dsml.calls, ...rest.calls], cleanedText: rest.cleanedText ?? dsml.cleanedText };
+  // A truncated DSML block would otherwise end the turn silently, or let Pi
+  // run only the calls before it.
+  if (DSML_TAG.test(text.replace(DSML_BLOCK, ""))) {
+    return { ok: false, rejection: { reason: "incomplete_dsml" } };
   }
-
-  const normalizedText = normalizeQuotedToolCallResponse(text);
+  const normalizedText = normalizeQuotedToolCallResponse(dsmlToMarkers(text));
   if (!isToolCallMarkerResponse(normalizedText)) return { ok: true, calls: [] };
 
   const extraction = toolCallMarkers(normalizedText);
@@ -1061,7 +1056,7 @@ function detectXmlToolUse(text: string): string | undefined {
   // Claude Code uses <bash>, <read>, <edit>, etc. directly, but may also
   // emit <arg_key>/<arg_value> pairs inside those tags.
   const xmlToolPattern = /<(bash|read|edit|write|glob|grep|ls|webfetch|websearch|task|todowrite|question|skill|lsp|external_directory|doom_loop|agent|arg_key|arg_value)\b/i;
-  const match = text.match(xmlToolPattern) ?? text.match(DSML_INVOKE_NAME);
+  const match = text.match(xmlToolPattern);
   return match ? match[1].toLowerCase() : undefined;
 }
 
@@ -1074,6 +1069,8 @@ function toolCallRejectionMessage(
       return "OpenCode returned malformed Pi tool-call markers. Ensure each marker contains valid JSON with a string \"name\" and object \"arguments\".";
     case "invalid_payload":
       return 'OpenCode returned an invalid Pi tool-call payload. Each marker must contain valid JSON with a non-empty string "name" and object "arguments".';
+    case "incomplete_dsml":
+      return 'OpenCode returned an incomplete DeepSeek DSML tool call. Pi tools must be requested with <pi_tool_call>{"name":"...","arguments":{}}</pi_tool_call> markers.';
     case "unavailable_tool": {
       const available = [...allowedToolNames].map((name) =>
         JSON.stringify(name),

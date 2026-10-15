@@ -515,20 +515,33 @@ const dsmlResponse = [
 ].join("\n");
 
 test("parseToolCallResponse converts DeepSeek DSML tool calls into Pi calls", () => {
-  assert.deepEqual(parseToolCallResponse(dsmlResponse, new Set(["bash", "read"])), {
-    ok: true,
-    calls: [
-      { name: "bash", arguments: { command: 'echo "a < b" && ls', timeout: 120 } },
-      { name: "read", arguments: { path: "src/index.ts", offset: 1 } },
-    ],
-    cleanedText: "Let me check.\n",
-  });
+  assert.deepEqual(parseToolCalls(dsmlResponse, new Set(["bash", "read"])), [
+    { name: "bash", arguments: { command: 'echo "a < b" && ls', timeout: 120 } },
+    { name: "read", arguments: { path: "src/index.ts", offset: 1 } },
+  ]);
 
   const singleBar =
     '<｜DSML｜function_calls><｜DSML｜invoke name="read"><｜DSML｜parameter name="path" string="false">"a.md"</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜function_calls>';
   assert.deepEqual(parseToolCalls(singleBar, new Set(["read"])), [
     { name: "read", arguments: { path: "a.md" } },
   ]);
+});
+
+test("parseToolCallResponse keeps DSML and marker calls in response order", () => {
+  const write = '<pi_tool_call>{"name":"write","arguments":{"path":"a.md","content":"x"}}</pi_tool_call>';
+  const read =
+    '<｜DSML｜tool_calls><｜DSML｜invoke name="read"><｜DSML｜parameter name="path" string="true">a.md</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>';
+  const tools = new Set(["read", "write"]);
+  assert.deepEqual(parseToolCalls(write + read, tools).map((call) => call.name), ["write", "read"]);
+  assert.deepEqual(parseToolCalls(read + write, tools).map((call) => call.name), ["read", "write"]);
+});
+
+test("parseToolCallResponse rejects a complete DSML block followed by an unclosed one", () => {
+  const unclosed = dsmlResponse.split("\n").slice(1, 4).join("\n");
+  assert.deepEqual(parseToolCallResponse(`${dsmlResponse}\n${unclosed}`, new Set(["bash", "read"])), {
+    ok: false,
+    rejection: { reason: "incomplete_dsml" },
+  });
 });
 
 test("parseToolCallResponse rejects DSML calls to tools absent from the current context", () => {
@@ -780,7 +793,7 @@ test("streamOpenCode diagnoses an unclosed DSML tool call instead of ending the 
   );
 
   assert.equal(message.stopReason, "error");
-  assert.match(message.errorMessage ?? "", /disabled native tool \("bash"\).*<pi_tool_call>/);
+  assert.match(message.errorMessage ?? "", /incomplete DeepSeek DSML tool call.*<pi_tool_call>/);
 });
 
 test("streamOpenCode rejects native OpenCode tool use with marker remediation", async () => {
