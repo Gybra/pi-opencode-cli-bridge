@@ -33,8 +33,11 @@ export async function runOpenCodeProcess(
   const signalChild = (signal: NodeJS.Signals) => {
     if (!child.pid) return;
     try {
-      if (process.platform === "win32") child.kill(signal);
-      else process.kill(-child.pid, signal);
+      if (process.platform === "win32") {
+        // child.kill would stop only the launcher; /T also ends the native CLI it spawned.
+        spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true })
+          .on("error", () => child.kill(signal));
+      } else process.kill(-child.pid, signal);
     } catch { /* The child may already have exited. */ }
   };
   const stop = (error: Error) => {
@@ -59,7 +62,10 @@ export async function runOpenCodeProcess(
   });
   // Observe spawn failures immediately, even while a start callback is awaiting.
   void closed.catch(() => undefined);
-  child.stdin?.on("error", stop);
+  // A CLI that quits before reading its prompt explains why via stderr and exit code.
+  child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
+    if (error.code !== "EPIPE") stop(error);
+  });
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk: string) => {

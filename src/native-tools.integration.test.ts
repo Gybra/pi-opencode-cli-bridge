@@ -9,13 +9,13 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, Context, Model } from "@earendil-works/pi-ai";
 import { cleanupPiSessionState, streamOpenCode } from "./index.js";
 
 const OPENCODE_VERSION = "1.19.0";
 const realBin = process.env.OPENCODE_PI_INTEGRATION_BIN || "opencode";
 
-type Recorded = { tools: string[]; toolResults: number };
+type Recorded = { tools: string[]; toolResults: string[] };
 
 /** OpenAI-compatible SSE fixture: ask for native tools once, then answer with text. */
 async function startFixture() {
@@ -32,13 +32,15 @@ async function startFixture() {
       messages?: { role: string; content?: unknown }[];
     };
     const tools = (request.tools ?? []).map((tool) => tool.function?.name ?? "");
-    const toolResults = (request.messages ?? []).filter((message) => message.role === "tool").length;
+    const toolResults = (request.messages ?? [])
+      .filter((message) => message.role === "tool")
+      .map((message) => typeof message.content === "string" ? message.content : JSON.stringify(message.content));
     requests.push({ tools, toolResults });
 
     const base = { id: "chatcmpl-fixture", object: "chat.completion.chunk", created: 1, model: "model" };
     const send = (choices: unknown[]) => res.write(`data: ${JSON.stringify({ ...base, choices })}\n\n`);
     res.writeHead(200, { "content-type": "text/event-stream" });
-    if (tools.includes("write") && toolResults === 0) {
+    if (tools.includes("write") && toolResults.length === 0) {
       send([{ index: 0, delta: { role: "assistant", tool_calls: [
         { index: 0, id: "call_write", type: "function", function: { name: "write", arguments: JSON.stringify({ filePath: "write-sentinel.txt", content: "native write ran" }) } },
         { index: 1, id: "call_bash", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: "echo native bash ran > bash-sentinel.txt", description: "Write sentinel" }) } },
@@ -111,35 +113,52 @@ test("real OpenCode CLI version matches the pinned integration target", () => {
   assert.equal(version, OPENCODE_VERSION, `set OPENCODE_PI_INTEGRATION_BIN to OpenCode ${OPENCODE_VERSION}`);
 });
 
-for (const mode of ["intact", "missing", "failing"] as const) {
-  test(`native write and bash never run when the blocker plugin is ${mode}`, { timeout: 90_000 }, async () => {
-    const dir = mkdtempSync(join(tmpdir(), `pi-native-${mode}-`));
-    const fixture = await startFixture();
-    const previousBin = process.env.OPENCODE_PI_BIN;
-    const sessionId = `pi-native-${mode}-${Date.now()}`;
-    process.env.OPENCODE_PI_BIN = writeWrapper(dir, mode);
-    try {
-      const message = await streamOpenCode(fixtureModel(), {
-        messages: [{ role: "user", content: "Use your native tools.", timestamp: 1 }],
-      }, { sessionId, timeoutMs: 60_000, env: isolatedEnv(join(dir, "home"), fixture.port) }).result();
+async function runNativeScenario(mode: "intact" | "missing" | "failing", piTools: string[]) {
+  const dir = mkdtempSync(join(tmpdir(), `pi-native-${mode}-`));
+  const fixture = await startFixture();
+  const previousBin = process.env.OPENCODE_PI_BIN;
+  const sessionId = `pi-native-${mode}-${Date.now()}`;
+  process.env.OPENCODE_PI_BIN = writeWrapper(dir, mode);
+  try {
+    const message = await streamOpenCode(fixtureModel(), {
+      messages: [{ role: "user", content: "Use your native tools.", timestamp: 1 }],
+      tools: piTools.map((name) => ({ name, description: `${name} tool`, parameters: {} })) as Context["tools"],
+    }, { sessionId, timeoutMs: 60_000, env: isolatedEnv(join(dir, "home"), fixture.port) }).result();
+    const project = readFileSync(join(dir, "project-dir"), "utf8");
+    // Declarations stay on the request, and the fixture really asked for both calls.
+    const first = fixture.requests.find((request) => request.tools.includes("write"));
+    assert.ok(first, "native tool declarations were not sent to the model");
+    assert.ok(first.tools.includes("bash"));
+    assert.equal(existsSync(join(project, "write-sentinel.txt")), false, "native write executed");
+    assert.equal(existsSync(join(project, "bash-sentinel.txt")), false, "native bash executed");
+    return { message, requests: fixture.requests };
+  } finally {
+    process.env.OPENCODE_PI_BIN = previousBin;
+    if (previousBin === undefined) delete process.env.OPENCODE_PI_BIN;
+    await cleanupPiSessionState(sessionId);
+    await fixture.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
-      const project = readFileSync(join(dir, "project-dir"), "utf8");
-      // Declarations stay on the request, and the fixture really asked for both calls.
-      const first = fixture.requests.find((request) => request.tools.includes("write"));
-      assert.ok(first, "native tool declarations were not sent to the model");
-      assert.ok(first.tools.includes("bash"));
-      assert.equal(existsSync(join(project, "write-sentinel.txt")), false, "native write executed");
-      assert.equal(existsSync(join(project, "bash-sentinel.txt")), false, "native bash executed");
-      // `opencode run` emits tool_use only once a call has completed or failed,
-      // so this proves OpenCode handled a native call rather than skipping it.
-      assert.equal(message.stopReason, "error");
-      assert.match(message.errorMessage ?? "", /disabled native tool \("(write|bash)"\)/);
-    } finally {
-      process.env.OPENCODE_PI_BIN = previousBin;
-      if (previousBin === undefined) delete process.env.OPENCODE_PI_BIN;
-      await cleanupPiSessionState(sessionId);
-      await fixture.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
+for (const mode of ["intact", "missing", "failing"] as const) {
+  test(`native write and bash never run and become Pi calls when the blocker plugin is ${mode}`, { timeout: 90_000 }, async () => {
+    const { message } = await runNativeScenario(mode, ["write", "bash"]);
+    assert.equal(message.stopReason, "toolUse", message.errorMessage);
+    assert.deepEqual(
+      message.content.flatMap((c) => c.type === "toolCall" ? [{ name: c.name, arguments: c.arguments }] : []),
+      [
+        { name: "write", arguments: { path: "write-sentinel.txt", content: "native write ran" } },
+        { name: "bash", arguments: { command: "echo native bash ran > bash-sentinel.txt" } },
+      ],
+    );
   });
 }
+
+test("without Pi equivalents the model gets the blocker's correction and the run continues", { timeout: 90_000 }, async () => {
+  const { message, requests } = await runNativeScenario("intact", []);
+  const correction = requests.find((request) => request.toolResults.length > 0)?.toolResults.join("\n") ?? "";
+  assert.match(correction, /disabled in the Pi bridge[\s\S]*<pi_tool_call>\{\\?"name\\?":/);
+  assert.equal(message.stopReason, "stop", message.errorMessage);
+  assert.deepEqual(message.content, [{ type: "text", text: "done" }]);
+});

@@ -15,6 +15,7 @@ This fork fixes that and closes the gaps found while reviewing the code:
 - **No hung turns or orphaned processes.** Timeouts and cancellation kill the OpenCode process group, even when it ignores `SIGTERM`.
 - **Unexpected CLI output no longer crashes Pi.** Malformed events end the turn with an error.
 - **Clean shutdown.** Pi waits for temporary directories and OpenCode session records to be removed.
+- **Fewer failed turns when the model reaches for OpenCode's own tools.** A blocked native `bash`, `read`, `write`, `edit`, `grep` or `glob` call with a Pi equivalent is handed to Pi as a normal tool call. For other tools, the model is told how to ask Pi instead and can recover in the same run.
 - **Standard Pi provider hooks.** `onPayload`, `onResponse` and `onProviderStreamEvent` work as with built-in providers.
 - **Its own npm package**, with the original authors credited.
 
@@ -114,8 +115,9 @@ Without an override, discovery selects active models whose reported input and ou
 2. It replays Pi's transcript system messages to recover the current system prompt and tool declarations, including later changes.
 3. It creates a temporary OpenCode project containing a `pi-model` agent and a `tool.execute.before` plugin. Native tool declarations remain on the request. Execution is stopped twice: the plugin throws before any native tool runs, and the agent sets every permission to `ask`, which non-interactive `opencode run` rejects automatically. The second layer still holds if the plugin is missing or fails to load.
 4. It sends the prompt over standard input to `opencode run --format json`. User and tool-result images are written to temporary files and attached only when the model supports images.
-5. Text markers such as `<pi_tool_call>{"name":"read","arguments":{"path":"example.txt"}}</pi_tool_call>` become Pi tool calls. Tool names must be in the current Pi tool list; execution then follows Pi's normal validation and permission pipeline.
-6. Successful continuation turns reuse an OpenCode session and send only the new transcript. Changes to the model, prompt, tools or transcript prefix start a fresh session.
+5. If the model calls a native OpenCode tool anyway, the call is still blocked. When every native call in that step has a Pi equivalent in the current tool list (`bash`, `read`, `write`, `edit` with a single replacement, `grep`, and `glob` as `find`), the bridge stops OpenCode and returns them as Pi tool calls. Paths inside the temporary project become relative to Pi's working directory. Otherwise OpenCode continues: the model sees a correction asking it to use a Pi tool, and the turn fails only if it does not recover.
+6. Text markers such as `<pi_tool_call>{"name":"read","arguments":{"path":"example.txt"}}</pi_tool_call>` become Pi tool calls. Tool names must be in the current Pi tool list; execution then follows Pi's normal validation and permission pipeline.
+7. Successful continuation turns reuse an OpenCode session and send only the new transcript. Changes to the model, prompt, tools or transcript prefix start a fresh session.
 
 Pi's provider instrumentation hooks follow the CLI transport, not OpenCode's internal HTTP traffic:
 
@@ -134,7 +136,8 @@ Reasoning variants, image support and token limits follow CLI discovery. Token u
 - Pi and OpenCode can both retain local conversation data. Best-effort cleanup is not a guarantee of secure deletion.
 - Free-tier model availability and accepted request shapes can change. This fork makes no guarantee of continued access or compliance with a hosted provider's terms; review the applicable terms yourself.
 - Live tests with DeepSeek v4.1 Flash Free used thinking off. The first high-thinking test timed out; no default thinking setting is changed by this package.
-- Timeouts and cancellation escalate from `SIGTERM` to `SIGKILL` on the CLI's process group after 250 ms. Malformed or unexpected CLI events end the turn with an error instead of crashing Pi. Shutdown waits for session cleanup.
+- At startup Pi warns if your OpenCode version is not 1.19.0, the version the native-tool guard was verified with.
+- Timeouts and cancellation escalate from `SIGTERM` to `SIGKILL` on the CLI's process group after 250 ms; on Windows the whole process tree is ended with `taskkill /T /F` (not tested on Windows). If OpenCode quits before reading the prompt, the turn shows OpenCode's own error rather than a broken-pipe error. Malformed or unexpected CLI events end the turn with an error instead of crashing Pi. Shutdown waits for session cleanup.
 
 See [SECURITY.md](SECURITY.md) for the trust boundaries and [docs/code-review.md](https://github.com/Gybra/pi-opencode-cli-bridge/blob/main/docs/code-review.md) for what was fixed and what remains. This is an experimental, unaudited fork.
 
