@@ -1009,6 +1009,9 @@ export function parseToolCallResponse(
   text: string,
   allowedToolNames?: ReadonlySet<string>,
 ): ToolCallParseResult {
+  // A turn without tools (e.g. a compaction summary) cannot call any, so tool
+  // syntax it quotes is prose.
+  if (allowedToolNames?.size === 0) return { ok: true, calls: [] };
   const normalizedText = dsmlToMarkers(normalizeQuotedToolCallResponse(text));
   if (normalizedText === undefined) {
     return { ok: false, rejection: { reason: "incomplete_dsml" } };
