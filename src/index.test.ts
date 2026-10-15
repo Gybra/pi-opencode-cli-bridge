@@ -563,6 +563,12 @@ test("parseToolCallResponse rejects a complete DSML block followed by an unclose
   });
 });
 
+test("parseToolCallResponse treats tool syntax as prose when the turn has no tools", () => {
+  // A compaction summary of DSML work quotes both syntaxes; it has no tools to call.
+  const summary = `Fixed \`<｜DSML｜invoke\` parsing.\n${dsmlResponse}\n<pi_tool_call>{"name":"...","arguments":{}}</pi_tool_call>`;
+  assert.deepEqual(parseToolCallResponse(summary, new Set()), { ok: true, calls: [] });
+});
+
 test("parseToolCallResponse rejects DSML calls to tools absent from the current context", () => {
   assert.deepEqual(parseToolCallResponse(dsmlResponse, new Set(["read"])), {
     ok: false,
@@ -1927,7 +1933,7 @@ process.stdin.on("end", () => {
 });
 `,
       () =>
-        streamOpenCode(fakeModel(), userContext(["boom"]), {
+        streamOpenCode(fakeModel(), userContext(["boom"], ["bash"]), {
           sessionId: piSessionId,
         }).result(),
     );
