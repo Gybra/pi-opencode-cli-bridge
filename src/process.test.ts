@@ -41,13 +41,17 @@ test("process cancellation kills the child even while its async observer is bloc
   assert.ok(Date.now() - started < 2000);
 });
 
-test("process converts consumer failures and stdin EPIPE into rejected requests", async () => {
+test("process converts consumer failures into rejected requests", async () => {
   await assert.rejects(run('process.stdout.write("ready"); setTimeout(() => process.exit(0), 3000);', {
     onStdout: async () => { throw new Error("observer failed"); },
   }), /observer failed/);
-  await assert.rejects(run('process.stdin.destroy(); process.exit(0);', {
+});
+
+test("process reports the CLI's own exit when it quits before reading stdin", async () => {
+  const result = await run('process.stdin.destroy(); process.stderr.write("unknown flag"); process.exit(2);', {
     input: "x".repeat(16 * 1024 * 1024),
-  }), /EPIPE|ECONNRESET|closed/i);
+  });
+  assert.deepEqual(result, { stdout: "", stderr: "unknown flag", code: 2 });
 });
 
 test("process consumes stdout sequentially without duplicating captured output", async () => {

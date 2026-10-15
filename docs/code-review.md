@@ -20,6 +20,13 @@ Each fix started from a test that failed against the previous code.
 | 4. Ignored instrumentation | `onPayload` receives `{ prompt }` and may replace it (validated); `onResponse` reports the CLI transport (`status: 0`, `x-pi-transport: opencode-cli`); `onProviderStreamEvent` is awaited per validated event. A payload hook forces a fresh OpenCode session. Provider `env` reaches the CLI without overriding bridge settings. | Order, replacement on actual stdin, invalid payloads, callback failures, cancellation while each hook waits, session freshness and env tests. |
 | 5. Native-tool guard coverage | Integration test with the real OpenCode 1.19.0 CLI and a local OpenAI-compatible fixture requesting native `write` and `bash`. It showed the plugin alone fails open: with the plugin removed or failing at startup, OpenCode wrote the sentinel file. The agent now also sets `permission: { "*": ask }`; declarations stay on the request and `opencode run` auto-rejects the ask. | Intact, missing and failing plugin scenarios pass; removing only the permission rule makes the last two fail again. A live DeepSeek v4.1 Flash Free text and Pi `read` run still succeed through Zen with the new agent. |
 
+Follow-ups after 0.1.0:
+
+- Blocked native calls with an exact Pi equivalent become Pi tool calls instead of failing the turn, and the blocker's message tells the model how to request a Pi tool. Verified with the real CLI and the fixture; live DeepSeek runs used markers, so the translation path was not observed against a hosted model.
+- Startup warns when OpenCode is not 1.19.0.
+- On Windows, cancellation ends the process tree with `taskkill /T /F`. Not run on Windows.
+- A CLI that exits before reading stdin now reports its own stderr and exit code instead of `EPIPE`.
+
 Residual risks: the guard is verified only for OpenCode 1.19.0. Your own OpenCode configuration is still loaded, and tools it adds, such as MCP servers, were not tested. Neither layer is a sandbox. Linux CI covers the fixture, not a hosted model; Windows and high-thinking reliability remain unverified.
 
 ## What already follows the expected practices

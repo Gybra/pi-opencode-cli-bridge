@@ -1,8 +1,8 @@
 import { runOpenCodeProcess } from "./process.js";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, relative, sep } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerApiProvider } from "@earendil-works/pi-ai/compat";
 import {
@@ -29,6 +29,8 @@ import {
 const PROVIDER_ID = "opencode-cli";
 const API_ID = "opencode-cli-runner";
 const AGENT_ID = "pi-model";
+// The native-tool guard is verified against this CLI release by the integration test.
+const VERIFIED_OPENCODE_VERSION = "1.19.0";
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 16_384;
 const DISCOVERY_TIMEOUT_MS = 8_000;
@@ -606,6 +608,72 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+/**
+ * Map a blocked native OpenCode call onto the equivalent Pi tool, so Pi runs
+ * it under its own permissions. Calls whose semantics differ stay untranslated.
+ */
+export function translateNativeToolCall(
+  tool: string,
+  input: unknown,
+  allowedToolNames: Set<string>,
+  projectDirs: string[],
+): ParsedToolCall | undefined {
+  const args = objectRecord(input);
+  if (!args) return undefined;
+  const text = (key: string) => typeof args[key] === "string" ? args[key] as string : undefined;
+  const count = (key: string) =>
+    typeof args[key] === "number" && args[key] > 0 ? args[key] as number : undefined;
+  // OpenCode resolves paths in its temporary project; Pi resolves them in the real one.
+  const path = (key: string) => {
+    const value = text(key);
+    const dir = value && projectDirs.find((d) => value === d || value.startsWith(d + sep));
+    return dir ? relative(dir, value) || "." : value;
+  };
+  const call = (name: string, entries: Record<string, unknown>): ParsedToolCall => ({
+    name,
+    arguments: Object.fromEntries(Object.entries(entries).filter(([, v]) => v !== undefined)),
+  });
+  let result: ParsedToolCall | undefined;
+  switch (tool) {
+    case "bash": {
+      // shortcut: absolute temp-project paths inside the command are not rewritten; parse them if models rely on it.
+      const timeout = count("timeout");
+      if (text("command") === undefined || (args.workdir !== undefined && path("workdir") !== ".")) break;
+      result = call("bash", { command: text("command"), timeout: timeout && Math.ceil(timeout / 1000) });
+      break;
+    }
+    case "read":
+      if (text("filePath") !== undefined) {
+        result = call("read", { path: path("filePath"), offset: count("offset"), limit: count("limit") });
+      }
+      break;
+    case "write":
+      if (text("filePath") !== undefined && text("content") !== undefined) {
+        result = call("write", { path: path("filePath"), content: text("content") });
+      }
+      break;
+    case "edit":
+      // Pi edits need one unique, non-empty match: no replaceAll or create-by-edit.
+      if (text("filePath") !== undefined && text("oldString") && text("newString") !== undefined &&
+          args.replaceAll !== true) {
+        result = call("edit", {
+          path: path("filePath"),
+          edits: [{ oldText: text("oldString"), newText: text("newString") }],
+        });
+      }
+      break;
+    case "grep":
+      if (text("pattern") !== undefined) {
+        result = call("grep", { pattern: text("pattern"), path: path("path"), glob: text("include") });
+      }
+      break;
+    case "glob":
+      if (text("pattern") !== undefined) result = call("find", { pattern: text("pattern"), path: path("path") });
+      break;
+  }
+  return result && allowedToolNames.has(result.name) ? result : undefined;
 }
 
 function safeJson(value: unknown): string {
@@ -1296,7 +1364,7 @@ You are the OpenCode side of a Pi Coding Agent bridge. Do not use OpenCode nativ
     join(pluginsDir, "pi-native-tool-blocker.js"),
     `export const PiNativeToolBlocker = async () => ({
   "tool.execute.before": async (input) => {
-    throw new Error("Native OpenCode tool blocked by opencode-pi: " + input.tool)
+    throw new Error("Native OpenCode tool " + input.tool + " is disabled in the Pi bridge. Request the equivalent Pi tool instead: reply with <pi_tool_call>{\\"name\\":\\"tool_name\\",\\"arguments\\":{}}</pi_tool_call> using a tool from the Pi tool list.")
   },
 })
 `,
@@ -1331,6 +1399,12 @@ export function streamOpenCode(
     let stdoutRemainder = "";
     let capturedSessionId: string | undefined;
     let opencodeToolUse: string | undefined;
+    // Text after the last blocked native call shows whether the model recovered in-run.
+    let nativeTextMark = 0;
+    let stepNativeCalls: (ParsedToolCall | undefined)[] = [];
+    let nativeCalls: ParsedToolCall[] | undefined;
+    // Thrown from the event handler so the process runner stops OpenCode.
+    const nativeStepEnd = new Error("OpenCode stopped after a translated native step");
     let opencodeError: string | undefined;
     let finishReason: "stop" | "length" = "stop";
     // Per-Pi-session reuse key supplied by Pi core (stable for the life of
@@ -1351,6 +1425,9 @@ export function streamOpenCode(
         tools: getCurrentTools(messages),
       };
       const transcriptParts = serializedTranscriptParts(context.messages);
+      const allowedToolNames = new Set(
+        context.tools?.map((tool) => tool.name) ?? [],
+      );
       stream.push({ type: "start", partial: output });
       if (options?.signal?.aborted) throw new Error("Request was aborted");
 
@@ -1381,6 +1458,7 @@ export function streamOpenCode(
             return dir;
           });
       if (options?.signal?.aborted) throw new Error("Request was aborted");
+      const projectDirs = [sessionDir, await realpath(sessionDir).catch(() => sessionDir)];
       const images = imageContentsForModel(
         sentMessages,
         model.input.includes("image"),
@@ -1410,7 +1488,8 @@ export function streamOpenCode(
       for (const path of imagePaths) args.push("--file", path);
 
       const handleLine = async (line: string) => {
-        if (!line.trim()) return;
+        // Output after a translated native step belongs to a run Pi already ended.
+        if (!line.trim() || nativeCalls) return;
         let parsed: unknown;
         try {
           parsed = JSON.parse(line);
@@ -1449,26 +1528,42 @@ export function streamOpenCode(
             finishReason = "length";
           }
           const tokens = objectRecord(part?.tokens);
-          if (!tokens) return;
-          const cache = objectRecord(tokens.cache);
-          output.usage.input = Number(tokens.input ?? 0);
-          output.usage.output =
-            Number(tokens.output ?? 0) + Number(tokens.reasoning ?? 0);
-          output.usage.cacheRead = Number(cache?.read ?? 0);
-          output.usage.cacheWrite = Number(cache?.write ?? 0);
-          output.usage.totalTokens = Number(
-            tokens.total ??
-              output.usage.input +
-                output.usage.output +
-                output.usage.cacheRead +
-                output.usage.cacheWrite,
-          );
-          calculateCost(model, output.usage);
+          if (tokens) {
+            const cache = objectRecord(tokens.cache);
+            output.usage.input = Number(tokens.input ?? 0);
+            output.usage.output =
+              Number(tokens.output ?? 0) + Number(tokens.reasoning ?? 0);
+            output.usage.cacheRead = Number(cache?.read ?? 0);
+            output.usage.cacheWrite = Number(cache?.write ?? 0);
+            output.usage.totalTokens = Number(
+              tokens.total ??
+                output.usage.input +
+                  output.usage.output +
+                  output.usage.cacheRead +
+                  output.usage.cacheWrite,
+            );
+            calculateCost(model, output.usage);
+          }
+          const calls = stepNativeCalls;
+          stepNativeCalls = [];
+          // A fully translatable step ends the turn like a normal tool-call response.
+          // Otherwise OpenCode continues and the model sees the blocker's correction.
+          if (calls.length > 0 && calls.every(Boolean)) {
+            nativeCalls = calls as ParsedToolCall[];
+            throw nativeStepEnd;
+          }
           return;
         }
 
         if (event.type === "tool_use") {
           opencodeToolUse = part?.tool ? String(part.tool) : "unknown";
+          nativeTextMark = accumulatedText.length;
+          stepNativeCalls.push(translateNativeToolCall(
+            opencodeToolUse,
+            objectRecord(part?.state)?.input,
+            allowedToolNames,
+            projectDirs,
+          ));
           return;
         }
 
@@ -1514,22 +1609,24 @@ export function streamOpenCode(
           for (const line of lines) await handleLine(line);
         },
         onEnd: () => handleLine(stdoutRemainder),
+      }).catch((error: unknown) => {
+        // Stopping OpenCode after a translated native step is a normal end of turn.
+        if (error === nativeStepEnd) return undefined;
+        throw error;
       });
-      const { code } = result;
-      stderr = (stderr + result.stderr).slice(-STDERR_LIMIT);
-      if (code !== 0) {
-        throw new Error(stderr.trim() || `opencode exited with code ${code}`);
+      if (result) {
+        stderr = (stderr + result.stderr).slice(-STDERR_LIMIT);
+        if (result.code !== 0) {
+          throw new Error(stderr.trim() || `opencode exited with code ${result.code}`);
+        }
       }
       if (opencodeError) throw new Error(opencodeError);
-      if (opencodeToolUse) {
+      if (opencodeToolUse && !nativeCalls && !accumulatedText.slice(nativeTextMark).trim()) {
         throw new Error(
           `OpenCode attempted to use its disabled native tool (${JSON.stringify(opencodeToolUse)}). Retry the request; Pi tools must be requested with <pi_tool_call>{"name":"...","arguments":{}}</pi_tool_call> markers.`,
         );
       }
 
-      const allowedToolNames = new Set(
-        context.tools?.map((tool) => tool.name) ?? [],
-      );
       const toolCallResult = parseToolCallResponse(
         accumulatedText,
         allowedToolNames,
@@ -1539,7 +1636,7 @@ export function streamOpenCode(
           toolCallRejectionMessage(toolCallResult, allowedToolNames),
         );
       }
-      const toolCalls = toolCallResult.calls;
+      const toolCalls = [...toolCallResult.calls, ...(nativeCalls ?? [])];
       // Unrecoverable marker text is stripped so it never leaks into the
       // visible chat response; remaining prose still displays normally.
       const displayText = toolCallResult.cleanedText ?? accumulatedText;
@@ -1585,7 +1682,8 @@ export function streamOpenCode(
       );
       // The turn succeeded: record the session for reuse, or delete the
       // one-shot session record so it cannot accumulate (#71, #75).
-      if (piState && !payloadHook) {
+      // A session holding a blocked native call cannot be continued as a transcript prefix.
+      if (piState && !payloadHook && !nativeCalls) {
         piState.opencodeSessionId =
           capturedSessionId ?? piState.opencodeSessionId;
         piState.modelId = model.id;
@@ -1593,6 +1691,7 @@ export function streamOpenCode(
         piState.systemPrompt = context.systemPrompt ?? "";
         piState.sentParts = transcriptParts;
       } else {
+        if (piState) dropOpencodeSession(piState);
         deleteOpenCodeSession(capturedSessionId);
       }
 
@@ -1800,6 +1899,13 @@ export default async function opencodePiExtension(pi: ExtensionAPI) {
       `opencode-pi: registered ${registeredModels.length} OpenCode CLI model(s). Use /model and pick ${PROVIDER_ID}.`,
       "info",
     );
+    const version = /\d+\.\d+\.\d+/.exec(cliStatus.summary)?.[0];
+    if (version !== VERIFIED_OPENCODE_VERSION) {
+      ctx.ui.notify(
+        `opencode-pi: OpenCode ${version ?? cliStatus.summary} is not ${VERIFIED_OPENCODE_VERSION}, the version the native-tool guard was verified with. Native OpenCode tools may not stay blocked.`,
+        "warning",
+      );
+    }
     if (lastDiscoveryError) {
       ctx.ui.notify(
         `opencode-pi: model discovery used fallback (${lastDiscoveryError})`,

@@ -39,6 +39,7 @@ import opencodePiExtension, {
   resolveTurnTimeoutMs,
   streamOpenCode,
   trackedPiSessionCount,
+  translateNativeToolCall,
 } from "./index.js";
 
 function fakeModel(): Model<Api> {
@@ -716,6 +717,83 @@ test("streamOpenCode rejects native OpenCode tool use with marker remediation", 
   );
 });
 
+test("translateNativeToolCall maps blocked OpenCode calls onto equivalent Pi tools", () => {
+  const all = new Set(["bash", "read", "write", "edit", "grep", "find"]);
+  const dirs = ["/tmp/oc-project", "/private/tmp/oc-project"];
+  const t = (tool: string, input: unknown, allowed = all) => translateNativeToolCall(tool, input, allowed, dirs);
+  assert.deepEqual(t("bash", { command: "ls", description: "List", timeout: 1500 }), { name: "bash", arguments: { command: "ls", timeout: 2 } });
+  assert.deepEqual(t("bash", { command: "ls", workdir: "/tmp/oc-project" }), { name: "bash", arguments: { command: "ls" } });
+  assert.deepEqual(t("read", { filePath: "/private/tmp/oc-project/src/a.ts", offset: 3, limit: 10 }), { name: "read", arguments: { path: "src/a.ts", offset: 3, limit: 10 } });
+  assert.deepEqual(t("read", { filePath: "/etc/hosts" }), { name: "read", arguments: { path: "/etc/hosts" } });
+  assert.deepEqual(t("write", { filePath: "/tmp/oc-project/n.txt", content: "x" }), { name: "write", arguments: { path: "n.txt", content: "x" } });
+  assert.deepEqual(t("edit", { filePath: "a.ts", oldString: "a", newString: "b" }), { name: "edit", arguments: { path: "a.ts", edits: [{ oldText: "a", newText: "b" }] } });
+  assert.deepEqual(t("grep", { pattern: "x", path: "/tmp/oc-project", include: "*.ts" }), { name: "grep", arguments: { pattern: "x", path: ".", glob: "*.ts" } });
+  assert.deepEqual(t("glob", { pattern: "**/*.ts" }), { name: "find", arguments: { pattern: "**/*.ts" } });
+  // Different semantics, missing Pi tools or malformed input stay untranslated.
+  assert.equal(t("edit", { filePath: "a.ts", oldString: "a", newString: "b", replaceAll: true }), undefined);
+  assert.equal(t("edit", { filePath: "a.ts", oldString: "", newString: "b" }), undefined);
+  assert.equal(t("bash", { command: "ls", workdir: "/elsewhere" }), undefined);
+  assert.equal(t("bash", { command: 1 }), undefined);
+  assert.equal(t("webfetch", { url: "https://example.com" }), undefined);
+  assert.equal(t("bash", { command: "ls" }, new Set(["read"])), undefined);
+  assert.equal(t("read", null), undefined);
+});
+
+test("streamOpenCode turns a translatable native step into Pi tool calls and stops OpenCode", async () => {
+  const started = Date.now();
+  const message = await withFakeOpenCode(`
+const dir = process.argv[process.argv.indexOf("--dir") + 1];
+const emit = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
+emit({ type: "text", part: { text: "Checking." } });
+emit({ type: "tool_use", part: { tool: "read", state: { status: "error", input: { filePath: dir + "/src/a.ts" } } } });
+emit({ type: "tool_use", part: { tool: "bash", state: { status: "error", input: { command: "npm test", timeout: 60000 } } } });
+emit({ type: "step_finish", part: {} });
+setTimeout(() => { emit({ type: "text", part: { text: "after rejection" } }); process.exit(0); }, 5000);
+`, () => streamOpenCode(fakeModel(), fakeContext(["read", "bash"])).result());
+  assert.ok(Date.now() - started < 3000, "OpenCode kept running after the translated step");
+  assert.equal(message.stopReason, "toolUse");
+  assert.deepEqual(
+    message.content.flatMap((c) => c.type === "toolCall" ? [{ name: c.name, arguments: c.arguments }] : []),
+    [{ name: "read", arguments: { path: "src/a.ts" } }, { name: "bash", arguments: { command: "npm test", timeout: 60 } }],
+  );
+});
+
+test("streamOpenCode accepts the model's recovery after an untranslatable native call", async () => {
+  const recovered = await withFakeOpenCode(fakeEventScript([
+    { type: "tool_use", part: { tool: "webfetch", state: { status: "error", input: { url: "https://x" } } } },
+    { type: "step_finish", part: {} },
+    { type: "text", part: { text: '<pi_tool_call>{"name":"read","arguments":{"path":"a.ts"}}</pi_tool_call>' } },
+  ]), () => streamOpenCode(fakeModel(), fakeContext(["read"])).result());
+  assert.equal(recovered.stopReason, "toolUse");
+  assert.deepEqual(recovered.content.find((c) => c.type === "toolCall")?.arguments, { path: "a.ts" });
+
+  const unrecovered = await withFakeOpenCode(fakeEventScript([
+    { type: "text", part: { text: "Fetching." } },
+    { type: "tool_use", part: { tool: "webfetch", state: { status: "error", input: { url: "https://x" } } } },
+    { type: "step_finish", part: {} },
+  ]), () => streamOpenCode(fakeModel(), fakeContext(["read"])).result());
+  assert.equal(unrecovered.stopReason, "error");
+  assert.match(unrecovered.errorMessage ?? "", /disabled native tool \("webfetch"\)/);
+});
+
+test("session_start warns when OpenCode is not the version the native-tool guard was verified with", async () => {
+  const previousModels = process.env.OPENCODE_PI_MODELS;
+  process.env.OPENCODE_PI_MODELS = "custom-model-a";
+  try {
+    const recorder = sessionStartRecorder();
+    const ctx = recordingCtx();
+    await withFakeOpenCode('process.stdout.write("opencode 9.9.9\\n");', async () => {
+      await opencodePiExtension(recorder.extension);
+      await recorder.run(ctx);
+    });
+    const warnings = ctx.notifications.filter((n) => n.level === "warning");
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0]!.message, /OpenCode 9\.9\.9.*1\.19\.0/);
+  } finally {
+    restoreEnv("OPENCODE_PI_MODELS", previousModels);
+  }
+});
+
 test("streamOpenCode diagnoses empty provider output with detailed context", async () => {
   const message = await withFakeOpenCode("", () =>
     streamOpenCode(fakeModel(), fakeContext()).result(),
@@ -1220,7 +1298,7 @@ test("session_start produces no warning when opencode answers --version", async 
     const ctx = recordingCtx();
     await withFakeOpenCode(
       `if (process.argv.includes("--version")) {
-  process.stdout.write("opencode 9.9.9\\n");
+  process.stdout.write("1.19.0\\n");
   process.exit(0);
 }
 process.stdout.write([

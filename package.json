@@ -1,6 +1,6 @@
 {
   "name": "pi-opencode-cli-bridge",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Bridge the OpenCode CLI into Pi Coding Agent",
   "type": "module",
   "main": "./src/index.ts",
@@ -34,9 +34,18 @@
   ],
   "author": "pi-extensions contributors",
   "contributors": [
-    { "name": "luongnv89", "url": "https://github.com/luongnv89" },
-    { "name": "Rodrigo Manuel Jager Pinheiro", "url": "https://github.com/rodrigojager" },
-    { "name": "Gybra", "url": "https://github.com/Gybra" }
+    {
+      "name": "luongnv89",
+      "url": "https://github.com/luongnv89"
+    },
+    {
+      "name": "Rodrigo Manuel Jager Pinheiro",
+      "url": "https://github.com/rodrigojager"
+    },
+    {
+      "name": "Gybra",
+      "url": "https://github.com/Gybra"
+    }
   ],
   "license": "MIT",
   "engines": {
