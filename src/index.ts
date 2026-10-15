@@ -1707,10 +1707,25 @@ export function streamOpenCode(
           toolCallRejectionMessage(toolCallResult, allowedToolNames),
         );
       }
-      const toolCalls = [...toolCallResult.calls, ...(nativeCalls ?? [])];
       // Unrecoverable marker text is stripped so it never leaks into the
       // visible chat response; remaining prose still displays normally.
       const displayText = toolCallResult.cleanedText ?? accumulatedText;
+      let textCalls = toolCallResult.calls;
+      // DeepSeek sometimes writes its only calls in the reasoning and replies
+      // with nothing, which would end the turn silently.
+      if (textCalls.length === 0 && !nativeCalls && !displayText.trim()) {
+        const reasoningResult = parseToolCallResponse(
+          accumulatedThinking,
+          allowedToolNames,
+        );
+        if (!reasoningResult.ok) {
+          throw new Error(
+            toolCallRejectionMessage(reasoningResult, allowedToolNames),
+          );
+        }
+        textCalls = reasoningResult.calls;
+      }
+      const toolCalls = [...textCalls, ...(nativeCalls ?? [])];
       if (toolCalls.length === 0 && displayText.trim()) {
         // Check if the model tried to use XML-style tool-use instead of
         // <pi_tool_call> markers — a common mistake with Claude-based models.

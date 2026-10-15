@@ -809,6 +809,46 @@ test("streamOpenCode hands DeepSeek DSML tool calls to Pi", async () => {
   assert.ok(!JSON.stringify(message.content).includes("DSML"));
 });
 
+test("streamOpenCode hands Pi the calls DeepSeek wrote only in its reasoning", async () => {
+  const message = await withFakeOpenCode(
+    fakeEventScript([
+      { type: "reasoning", part: { text: 'One command is enough. <pi_tool_call>{"name":"bash","arguments":{"command":"ls"}}</pi_tool_call>' } },
+    ]),
+    () => streamOpenCode(fakeModel(), fakeContext(["bash"])).result(),
+  );
+
+  assert.equal(message.stopReason, "toolUse");
+  assert.deepEqual(
+    message.content.flatMap((part) => (part.type === "toolCall" ? [[part.name, part.arguments]] : [])),
+    [["bash", { command: "ls" }]],
+  );
+});
+
+test("streamOpenCode ignores reasoning drafts when the reply has text", async () => {
+  const message = await withFakeOpenCode(
+    fakeEventScript([
+      { type: "reasoning", part: { text: 'Draft: <pi_tool_call>{"name":"bash","arguments":{"command":"ls"}}</pi_tool_call>' } },
+      { type: "text", part: { text: "No command needed." } },
+    ]),
+    () => streamOpenCode(fakeModel(), fakeContext(["bash"])).result(),
+  );
+
+  assert.equal(message.stopReason, "stop");
+  assert.ok(!message.content.some((part) => part.type === "toolCall"));
+});
+
+test("streamOpenCode diagnoses broken calls in reasoning instead of ending the turn", async () => {
+  const message = await withFakeOpenCode(
+    fakeEventScript([
+      { type: "reasoning", part: { text: dsmlResponse.split("\n").slice(0, 4).join("\n") } },
+    ]),
+    () => streamOpenCode(fakeModel(), fakeContext(["bash"])).result(),
+  );
+
+  assert.equal(message.stopReason, "error");
+  assert.match(message.errorMessage ?? "", /incomplete DeepSeek DSML tool call/);
+});
+
 test("streamOpenCode diagnoses an unclosed DSML tool call instead of ending the turn", async () => {
   const message = await withFakeOpenCode(
     fakeEventScript([
