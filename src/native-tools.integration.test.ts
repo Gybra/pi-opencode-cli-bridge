@@ -9,7 +9,9 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import type { Api, Context, Model } from "@earendil-works/pi-ai";
+import { createBashToolDefinition, createWriteToolDefinition } from "@earendil-works/pi-coding-agent";
+import { validateToolCall } from "@earendil-works/pi-ai";
+import type { Api, Model, Tool } from "@earendil-works/pi-ai";
 import { cleanupPiSessionState, streamOpenCode } from "./index.js";
 
 const OPENCODE_VERSION = "1.19.0";
@@ -113,7 +115,12 @@ test("real OpenCode CLI version matches the pinned integration target", () => {
   assert.equal(version, OPENCODE_VERSION, `set OPENCODE_PI_INTEGRATION_BIN to OpenCode ${OPENCODE_VERSION}`);
 });
 
-async function runNativeScenario(mode: "intact" | "missing" | "failing", piTools: string[]) {
+// Pi's real tool schemas, so translated calls are checked against what Pi will validate.
+const piTools = [createWriteToolDefinition, createBashToolDefinition]
+  .map((create) => create(process.cwd()))
+  .map(({ name, description, parameters }) => ({ name, description, parameters })) as unknown as Tool[];
+
+async function runNativeScenario(mode: "intact" | "missing" | "failing", tools: Tool[]) {
   const dir = mkdtempSync(join(tmpdir(), `pi-native-${mode}-`));
   const fixture = await startFixture();
   const previousBin = process.env.OPENCODE_PI_BIN;
@@ -122,7 +129,7 @@ async function runNativeScenario(mode: "intact" | "missing" | "failing", piTools
   try {
     const message = await streamOpenCode(fixtureModel(), {
       messages: [{ role: "user", content: "Use your native tools.", timestamp: 1 }],
-      tools: piTools.map((name) => ({ name, description: `${name} tool`, parameters: {} })) as Context["tools"],
+      tools,
     }, { sessionId, timeoutMs: 60_000, env: isolatedEnv(join(dir, "home"), fixture.port) }).result();
     const project = readFileSync(join(dir, "project-dir"), "utf8");
     // Declarations stay on the request, and the fixture really asked for both calls.
@@ -143,8 +150,9 @@ async function runNativeScenario(mode: "intact" | "missing" | "failing", piTools
 
 for (const mode of ["intact", "missing", "failing"] as const) {
   test(`native write and bash never run and become Pi calls when the blocker plugin is ${mode}`, { timeout: 90_000 }, async () => {
-    const { message } = await runNativeScenario(mode, ["write", "bash"]);
+    const { message } = await runNativeScenario(mode, piTools);
     assert.equal(message.stopReason, "toolUse", message.errorMessage);
+    for (const call of message.content) if (call.type === "toolCall") validateToolCall(piTools, call);
     assert.deepEqual(
       message.content.flatMap((c) => c.type === "toolCall" ? [{ name: c.name, arguments: c.arguments }] : []),
       [
