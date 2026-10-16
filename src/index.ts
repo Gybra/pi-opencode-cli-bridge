@@ -1108,11 +1108,11 @@ export function parseToolCallResponse(
   }
 
   if (strippedSpans.length === 0) return { ok: true, calls: parsed };
-  return {
-    ok: true,
-    calls: parsed,
-    cleanedText: stripMarkerSpans(normalizedText, strippedSpans),
-  };
+  const cleanedText = stripMarkerSpans(normalizedText.trim(), strippedSpans);
+  if (parsed.length === 0 && !cleanedText.trim()) {
+    return { ok: false, rejection: { reason: "malformed_markers" } };
+  }
+  return { ok: true, calls: parsed, cleanedText };
 }
 
 export function parseToolCalls(
@@ -1148,7 +1148,7 @@ function toolCallRejectionMessage(
     case "invalid_payload":
       return 'OpenCode returned an invalid Pi tool-call payload. Each marker must contain valid JSON with a non-empty string "name" and object "arguments".';
     case "incomplete_dsml":
-      return 'OpenCode returned an incomplete DeepSeek DSML tool call. Pi tools must be requested with <pi_tool_call>{"name":"...","arguments":{}}</pi_tool_call> markers.';
+      return "OpenCode returned an incomplete DeepSeek DSML tool call.";
     case "unavailable_tool": {
       const available = [...allowedToolNames].map((name) =>
         JSON.stringify(name),
@@ -1544,6 +1544,7 @@ function streamOpenCodeAttempt(
     let capturedSessionId: string | undefined;
     let opencodeToolUse: string | undefined;
     let recoverableFailure: Error | undefined;
+    let toolCallFailure: Extract<ToolCallParseResult, { ok: false }> | undefined;
     // Text after the last blocked native call shows whether the model recovered in-run.
     let nativeTextMark = 0;
     let stepNativeCalls: (ParsedToolCall | undefined)[] = [];
@@ -1778,6 +1779,7 @@ function streamOpenCodeAttempt(
         allowedToolNames,
       );
       if (!toolCallResult.ok) {
+        toolCallFailure = toolCallResult;
         throw new Error(
           toolCallRejectionMessage(toolCallResult, allowedToolNames),
         );
@@ -1798,6 +1800,7 @@ function streamOpenCodeAttempt(
           reasoningResult = { ok: false, rejection: { reason: "malformed_markers" } };
         }
         if (!reasoningResult.ok) {
+          toolCallFailure = reasoningResult;
           throw new Error(
             toolCallRejectionMessage(reasoningResult, allowedToolNames),
           );
@@ -1943,6 +1946,10 @@ function streamOpenCodeAttempt(
       stream.push({ type: "done", reason: finishReason, message: output });
       stream.end();
     } catch (error) {
+      if (toolCallFailure && toolCallFailure.rejection.reason !== "unavailable_tool" && error instanceof Error) {
+        recoverableFailure = error;
+        if (!allowRecovery) error.message += " Recovery failed after one attempt.";
+      }
       // Any error, timeout, or abort drops the session ID so the next turn
       // starts fresh with the full transcript; the failed session record is
       // deleted best-effort and never fails the turn (#71, #75).
@@ -1953,9 +1960,11 @@ function streamOpenCodeAttempt(
           !options?.signal?.aborted && remainingMs > 0 && (!opencodeToolUse || context.tools?.length)) {
         setEstimatedUsage(model, output, prompt, accumulatedText + accumulatedThinking);
         const correction = [
-          opencodeToolUse
-            ? `Your previous attempt used the disabled OpenCode native tool ${JSON.stringify(opencodeToolUse)}.`
-            : "Your previous attempt ended with reasoning only, without an answer or Pi tool call. Provide a final answer or request a Pi tool, not just a plan to act.",
+          toolCallFailure
+            ? `Your previous attempt returned a malformed Pi tool call. ${recoverableFailure.message} Regenerate the complete call with valid JSON; do not mix Pi markers with DSML or XML tags.`
+            : opencodeToolUse
+              ? `Your previous attempt used the disabled OpenCode native tool ${JSON.stringify(opencodeToolUse)}.`
+              : "Your previous attempt ended with reasoning only, without an answer or Pi tool call. Provide a final answer or request a Pi tool, not just a plan to act.",
           `Available Pi tools: ${context.tools?.map(tool => tool.name).join(", ") || "none"}.`,
           "Complete the original request using only those Pi tools. Do not call any OpenCode native tool.",
           'Request Pi tools as <pi_tool_call>{"name":"tool_name","arguments":{}}</pi_tool_call> markers, or answer normally if no tool is needed.',

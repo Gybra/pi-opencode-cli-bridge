@@ -461,21 +461,25 @@ test("parseToolCallResponse recovers a complete JSON payload without a closing t
   );
 });
 
-test("parseToolCallResponse degrades unrecoverable markers to stripped plain text", () => {
+// Shapes captured from live DeepSeek/GLM failures; paths and commands are sanitized.
+const malformedLiveResponses = [
+  '<pi_tool_call>{"name":"read","arguments":{"path":"fixture.txt"}}</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>',
+  '<pi_tool_call>{"name":"bash","arguments":{"command":"grep REPORT_TOKEN fixture.html}}</pi_tool_call>',
+];
+
+test("parseToolCallResponse rejects unrecoverable markers when nothing usable remains", () => {
   const responses = [
     '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"}',
     '<pi_tool_call>{"name":"bash","arguments":{}} trailing prose',
     '<pi_tool_call>{"name":"bash","arguments":{}}</tool_call>',
     '<pi_tool_call>{"name":"bash","arguments":{}}<pi_tool_call>',
+    ...malformedLiveResponses,
   ];
 
-  for (const response of responses) {
-    // No hard failure: the marker text is stripped and the turn continues
-    // as a plain-text response instead of erroring the whole stream (#39).
-    assert.deepEqual(parseToolCallResponse(response, new Set(["bash"])), {
-      ok: true,
-      calls: [],
-      cleanedText: "",
+  for (const response of responses.flatMap(text => [text, ` \n${text}\n `])) {
+    assert.deepEqual(parseToolCallResponse(response, new Set(["read", "bash"])), {
+      ok: false,
+      rejection: { reason: "malformed_markers" },
     });
   }
 });
@@ -704,7 +708,7 @@ test("streamOpenCode diagnoses invalid markers before emitting any tool call", a
     const error = events.at(-1);
     assert.equal(error?.type, "error");
     if (error?.type !== "error") continue;
-    assert.equal(error.error.errorMessage, diagnostic);
+    assert.equal(error.error.errorMessage, `${diagnostic} Recovery failed after one attempt.`);
   }
 });
 
@@ -872,7 +876,8 @@ test("streamOpenCode diagnoses an unclosed DSML tool call instead of ending the 
   );
 
   assert.equal(message.stopReason, "error");
-  assert.match(message.errorMessage ?? "", /incomplete DeepSeek DSML tool call.*<pi_tool_call>/);
+  assert.match(message.errorMessage ?? "", /incomplete DeepSeek DSML tool call.*after one attempt/);
+  assert.doesNotMatch(message.errorMessage ?? "", /<pi_tool_call>/);
 });
 
 test("streamOpenCode reports failed native-tool recovery without exposing protocol markers", async () => {
@@ -961,6 +966,108 @@ for (const version of ["1.19.0", "2.0.30"]) {
   });
 }
 
+for (const version of ["1.19.0", "2.0.30"]) {
+  for (const channel of ["text", "reasoning"]) {
+    for (const [index, text] of [
+      ...malformedLiveResponses,
+      '<pi_tool_call>{"name":"read"}</pi_tool_call>',
+      dsmlResponse.split("\n").slice(0, 4).join("\n"),
+    ].entries()) {
+      test(`OpenCode ${version} regenerates malformed tool call ${index + 1} in ${channel}`, async () => {
+        const dir = mkdtempSync(join(tmpdir(), "pi-malformed-recovery-"));
+        const capture = join(dir, "calls.jsonl");
+        const sessionId = `pi-malformed-${version}-${channel}-${index}`;
+        const events: AssistantMessageEvent[] = [];
+        try {
+          await withFakeOpenCode(recoveryScript(capture, nativeRecoveryEvents, [
+            { type: channel, part: { text } },
+            { type: "step_finish", part: { tokens: { total: 10, input: 6, output: 4 } } },
+          ]), async () => {
+            const stream = streamOpenCode(fakeModel(), userContext(["Find the report token"], ["read", "bash"]), { sessionId });
+            for await (const event of stream) events.push(event);
+            const message = await stream.result();
+            assert.equal(message.stopReason, "toolUse", message.errorMessage);
+            assert.deepEqual(message.content.map(c => c.type === "toolCall" ? { name: c.name, arguments: c.arguments } : c), [
+              { name: "bash", arguments: { command: "rg needle ." } },
+            ]);
+            assert.equal(message.usage.totalTokens, 15);
+            assert.equal(events.filter(e => e.type === "start").length, 1);
+            assert.equal(events.filter(e => e.type === "done").length, 1);
+            assert.equal(events.filter(e => e.type === "toolcall_end").length, 1);
+            assert.equal(events.some(e => e.type === "error" || e.type === "thinking_delta"), false);
+            const calls = readInvocations(capture);
+            assert.equal(calls.length, 2);
+            assert.equal(calls[1]!.args.includes("--session"), false);
+            assert.match(calls[1]!.stdin, /Find the report token/);
+            assert.match(calls[1]!.stdin, /malformed Pi tool call/);
+            assert.match(calls[1]!.stdin, /Available Pi tools: read, bash/);
+
+            await streamOpenCode(fakeModel(), userContext(["Find the report token", "Next question"], ["read", "bash"]), { sessionId }).result();
+            const next = readInvocations(capture)[2]!;
+            assert.equal(next.args.includes("--session"), false);
+            assert.doesNotMatch(next.stdin, /Your previous attempt/);
+          }, version);
+        } finally {
+          await cleanupPiSessionState(sessionId);
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+}
+
+const malformedEvents = [{ type: "text", part: { text: malformedLiveResponses[0] } }];
+for (const [label, first, second] of [
+  ["malformed to malformed", malformedEvents, malformedEvents],
+  ["malformed to native", malformedEvents, [{ type: "tool_use", part: { tool: "grep" } }]],
+  ["native to malformed", undefined, malformedEvents],
+  ["reasoning to malformed", reasoningOnlyEvents, malformedEvents],
+  ["malformed to reasoning", malformedEvents, reasoningOnlyEvents],
+] as const) {
+  test(`malformed-call recovery shares one attempt with other failures (${label})`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-malformed-repeat-"));
+    const capture = join(dir, "calls.jsonl");
+    try {
+      const message = await withFakeOpenCode(recoveryScript(capture, [...second], first && [...first]), () =>
+        streamOpenCode(fakeModel(), fakeContext(["read", "bash"])).result());
+      assert.equal(message.stopReason, "error");
+      assert.match(message.errorMessage ?? "", /after one (?:recovery )?attempt/);
+      assert.doesNotMatch(message.errorMessage ?? "", /empty assistant response|<pi_tool_call>|<｜/);
+      assert.equal(readInvocations(capture).length, 2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const boundary of ["cancellation", "deadline"] as const) {
+  test(`malformed-call recovery does not retry after ${boundary}`, async t => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-malformed-budget-"));
+    const capture = join(dir, "calls.jsonl");
+    const controller = new AbortController();
+    const now = Date.now.bind(Date);
+    let elapsed = 0;
+    t.mock.method(Date, "now", () => now() + elapsed);
+    try {
+      const message = await withFakeOpenCode(recoveryScript(capture, nativeRecoveryEvents, [
+        ...malformedEvents, { type: "step_finish", part: {} },
+      ]), () => streamOpenCode(fakeModel(), fakeContext(["read", "bash"]), {
+        timeoutMs: 10_000,
+        signal: controller.signal,
+        onProviderStreamEvent: event => {
+          if ((event as { type: string }).type !== "step_finish") return;
+          if (boundary === "cancellation") controller.abort();
+          else elapsed = 100_000;
+        },
+      }).result());
+      assert.equal(message.stopReason, boundary === "cancellation" ? "aborted" : "error");
+      assert.equal(readInvocations(capture).length, 1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
 test("native-tool recovery stops after one attempt", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-native-repeat-"));
   const capture = join(dir, "calls.jsonl");
@@ -973,6 +1080,21 @@ test("native-tool recovery stops after one attempt", async () => {
     assert.match(message.errorMessage ?? "", /after one recovery attempt.*grep/);
     assert.doesNotMatch(message.errorMessage ?? "", /<pi_tool_call>/);
     assert.equal(readInvocations(capture).length, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("malformed-call recovery does not retry unavailable Pi tools", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-unavailable-no-retry-"));
+  const capture = join(dir, "calls.jsonl");
+  try {
+    const message = await withFakeOpenCode(recoveryScript(capture, nativeRecoveryEvents, [
+      { type: "text", part: { text: '<pi_tool_call>{"name":"bash","arguments":{"command":"pwd"}}</pi_tool_call>' } },
+    ]), () => streamOpenCode(fakeModel(), fakeContext(["read"])).result());
+    assert.equal(message.stopReason, "error");
+    assert.match(message.errorMessage ?? "", /unavailable Pi tool "bash"/);
+    assert.equal(readInvocations(capture).length, 1);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -2029,8 +2151,9 @@ test("streamOpenCode detaches the abort listener on the error path", async () =>
       streamOpenCode(fakeModel(), fakeContext(["read"]), { signal }).result(),
   );
 
-  assert.equal(added, 1);
-  assert.equal(removed, 1);
+  // Both the rejected attempt and its failed recovery release their listener.
+  assert.equal(added, 2);
+  assert.equal(removed, 2);
 });
 
 test("streamOpenCode detaches the abort listener on the timeout path", async () => {
@@ -2262,10 +2385,13 @@ process.stdin.on("end", () => {
     assert.equal(recovered.stopReason, "stop");
 
     const invocations = readInvocations(capturePath);
-    assert.equal(invocations.length, 3);
-    // The recovery turn starts a fresh full-transcript session.
+    assert.equal(invocations.length, 4);
     assert.equal(invocations[2]?.args.includes("--session"), false);
-    assert.match(invocations[2]?.stdin ?? "", /Conversation transcript/);
+    assert.match(invocations[2]?.stdin ?? "", /malformed Pi tool call/);
+    // The next Pi turn starts fresh, without the failed recovery's correction.
+    assert.equal(invocations[3]?.args.includes("--session"), false);
+    assert.match(invocations[3]?.stdin ?? "", /Conversation transcript/);
+    assert.doesNotMatch(invocations[3]?.stdin ?? "", /Your previous attempt/);
   } finally {
     await cleanupPiSessionState(piSessionId);
     rmSync(captureDir, { recursive: true, force: true });
