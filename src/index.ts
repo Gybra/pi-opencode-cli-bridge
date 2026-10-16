@@ -2,7 +2,7 @@ import { runOpenCodeProcess } from "./process.js";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, posix, win32 } from "node:path";
+import { dirname, join, posix, resolve, win32 } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerApiProvider } from "@earendil-works/pi-ai/compat";
 import {
@@ -116,7 +116,11 @@ let lastDiscoveryError: string | undefined;
 
 function opencodeBin(): string {
   const configured = process.env.OPENCODE_PI_BIN?.trim();
-  if (configured) return configured;
+  if (configured) {
+    return configured.includes("/") || configured.includes("\\")
+      ? resolve(configured)
+      : configured;
+  }
   if (process.platform === "win32") {
     // npm's `opencode.cmd` shim cannot be launched by spawn() without a shell.
     // Resolve the native executable installed beside the active Node runtime.

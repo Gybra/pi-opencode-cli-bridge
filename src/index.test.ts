@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdtempSync,
   readFileSync,
@@ -9,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, win32 } from "node:path";
+import { basename, dirname, join, relative, win32 } from "node:path";
 import test from "node:test";
 import {
   createBashToolDefinition,
@@ -2353,6 +2354,34 @@ process.stdout.write(JSON.stringify({ type: "text", part: { text: "v2 reply" } }
   assert.equal(message.stopReason, "stop", message.errorMessage);
   assert.deepEqual(message.content, [{ type: "text", text: "v2 reply" }]);
 });
+
+for (const executable of ["relative", "PATH"] as const) {
+  test(`OpenCode 2 launches a configured ${executable} executable from its isolated project`, async () => {
+    const previousPath = process.env.PATH;
+    const dir = mkdtempSync(join(process.cwd(), ".opencode-pi-bin-"));
+    try {
+      const message = await withFakeOpenCode(fakeEventScript([
+        { type: "text", part: { text: "configured executable ran" } },
+      ]), async () => {
+        const bin = join(dir, "opencode.js");
+        copyFileSync(process.env.OPENCODE_PI_BIN!, bin);
+        chmodSync(bin, 0o755);
+        if (executable === "relative") {
+          process.env.OPENCODE_PI_BIN = relative(process.cwd(), bin);
+        } else {
+          process.env.OPENCODE_PI_BIN = basename(bin);
+          process.env.PATH = `${dirname(bin)}${process.platform === "win32" ? ";" : ":"}${previousPath ?? ""}`;
+        }
+        return streamOpenCode(fakeModel(), fakeContext()).result();
+      }, "opencode v2.0.30");
+      assert.equal(message.stopReason, "stop", message.errorMessage);
+      assert.deepEqual(message.content, [{ type: "text", text: "configured executable ran" }]);
+    } finally {
+      restoreEnv("PATH", previousPath);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
 
 test("OpenCode 2 shell calls translate to Pi bash without dropping unsupported execution options", () => {
   const translate = (input: unknown) => translateNativeToolCall("shell", input, new Set(["bash"]), ["/tmp/project"]);
