@@ -29,7 +29,7 @@ import {
 const PROVIDER_ID = "opencode-cli";
 const API_ID = "opencode-cli-runner";
 const AGENT_ID = "pi-model";
-const MAX_SUPPORTED_OPENCODE_VERSION = "2.0.30";
+const MAX_SUPPORTED_OPENCODE_VERSION = "2.0.31";
 const cliVersions = new Map<string, string | undefined>();
 
 async function usesV2Cli(): Promise<boolean> {
