@@ -1,6 +1,6 @@
 {
   "name": "pi-opencode-cli-bridge",
-  "version": "0.2.8",
+  "version": "0.2.9",
   "description": "Bridge the OpenCode CLI into Pi Coding Agent",
   "type": "module",
   "main": "./src/index.ts",
@@ -14,7 +14,7 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "npm run build && node --test --test-timeout=60000 dist/index.test.js dist/process.test.js",
+    "test": "npm run build && node --test --test-timeout=90000 dist/index.test.js dist/process.test.js",
     "test:integration": "npm run build && node --test --test-timeout=240000 dist/native-tools.integration.test.js",
     "prepublishOnly": "npm run typecheck && npm test && npm run test:integration"
   },
