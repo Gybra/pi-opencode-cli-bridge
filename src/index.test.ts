@@ -888,7 +888,12 @@ test("streamOpenCode reports failed native-tool recovery without exposing protoc
   );
 });
 
-function nativeRecoveryScript(capturePath: string, nextEvents: unknown[]): string {
+const reasoningOnlyEvents = [
+  { type: "reasoning", part: { text: "I should use Pi bash to fetch the page. Let me do that." } },
+  { type: "step_finish", part: { tokens: { total: 10, input: 6, output: 4 } } },
+];
+
+function recoveryScript(capturePath: string, nextEvents: unknown[], firstEvents?: unknown[]): string {
   return `
 const fs = require("node:fs");
 if (process.argv[2] !== "run") process.exit(0);
@@ -898,7 +903,7 @@ process.stdin.on("end", () => {
   const capture = ${JSON.stringify(capturePath)};
   const previous = fs.existsSync(capture) ? fs.readFileSync(capture, "utf8").trim().split("\\n").length : 0;
   fs.appendFileSync(capture, JSON.stringify({ args: process.argv.slice(2), stdin: body }) + "\\n");
-  const events = previous === 0 ? [
+  const events = previous === 0 ? ${JSON.stringify(firstEvents)} ?? [
     { type: "text", part: { text: "discarded draft" } },
     { type: "reasoning", part: { text: "discarded reasoning" } },
     { type: "tool_use", part: { tool: "grep", state: { status: "error", input: { pattern: "needle", path: "." } } } },
@@ -920,7 +925,7 @@ for (const version of ["1.19.0", "2.0.30"]) {
     const events: AssistantMessageEvent[] = [];
     let payloads = 0;
     try {
-      const message = await withFakeOpenCode(nativeRecoveryScript(capture, nativeRecoveryEvents), async () => {
+      const message = await withFakeOpenCode(recoveryScript(capture, nativeRecoveryEvents), async () => {
         const stream = streamOpenCode(fakeModel(), userContext(["Find needle in this project"], ["read", "bash", "edit", "write"]), {
           onPayload: (payload) => {
             payloads++;
@@ -960,7 +965,7 @@ test("native-tool recovery stops after one attempt", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-native-repeat-"));
   const capture = join(dir, "calls.jsonl");
   try {
-    const message = await withFakeOpenCode(nativeRecoveryScript(capture, [
+    const message = await withFakeOpenCode(recoveryScript(capture, [
       { type: "tool_use", part: { tool: "grep", state: { status: "error", input: { pattern: "needle" } } } },
       { type: "step_finish", part: {} },
     ]), () => streamOpenCode(fakeModel(), fakeContext(["bash"])).result(), "2.0.30");
@@ -977,7 +982,7 @@ test("native-tool recovery is skipped when Pi exposes no tools", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-native-no-tools-"));
   const capture = join(dir, "calls.jsonl");
   try {
-    const message = await withFakeOpenCode(nativeRecoveryScript(capture, nativeRecoveryEvents), () =>
+    const message = await withFakeOpenCode(recoveryScript(capture, nativeRecoveryEvents), () =>
       streamOpenCode(fakeModel(), fakeContext()).result());
     assert.equal(message.stopReason, "error");
     assert.doesNotMatch(message.errorMessage ?? "", /after one recovery attempt/);
@@ -994,7 +999,7 @@ test("native-tool recovery does not retry after the turn budget expires", async 
   let elapsed = 0;
   t.mock.method(Date, "now", () => now() + elapsed);
   try {
-    const message = await withFakeOpenCode(nativeRecoveryScript(capture, nativeRecoveryEvents), () =>
+    const message = await withFakeOpenCode(recoveryScript(capture, nativeRecoveryEvents), () =>
       streamOpenCode(fakeModel(), fakeContext(["bash"]), {
         timeoutMs: 10_000,
         onProviderStreamEvent: event => {
@@ -1014,7 +1019,7 @@ test("native-tool recovery does not retry after cancellation", async () => {
   const capture = join(dir, "calls.jsonl");
   const controller = new AbortController();
   try {
-    const message = await withFakeOpenCode(nativeRecoveryScript(capture, nativeRecoveryEvents), () =>
+    const message = await withFakeOpenCode(recoveryScript(capture, nativeRecoveryEvents), () =>
       streamOpenCode(fakeModel(), fakeContext(["bash"]), {
         signal: controller.signal,
         onProviderStreamEvent: event => {
@@ -1033,7 +1038,7 @@ test("native-tool recovery does not reuse hidden correction history on the next 
   const capture = join(dir, "calls.jsonl");
   const sessionId = "pi-native-recovery-session";
   try {
-    await withFakeOpenCode(nativeRecoveryScript(capture, nativeRecoveryEvents), async () => {
+    await withFakeOpenCode(recoveryScript(capture, nativeRecoveryEvents), async () => {
       const first = await streamOpenCode(fakeModel(), userContext(["Find needle"], ["bash"]), { sessionId }).result();
       assert.equal(first.stopReason, "toolUse", first.errorMessage);
       const next = await streamOpenCode(fakeModel(), userContext(["Find needle", "Next question"], ["bash"]), { sessionId }).result();
@@ -1259,23 +1264,111 @@ test("streamOpenCode never spawns opencode when the signal aborts after image fi
   }
 });
 
-test("streamOpenCode succeeds when opencode emits reasoning-only output with no text or tool calls", async () => {
-  const message = await withFakeOpenCode(
-    `process.stdout.write(JSON.stringify({ type: "reasoning", part: { text: "thinking it through" } }) + "\\n");`,
-    () => streamOpenCode(fakeModel(), fakeContext()).result(),
-  );
+for (const version of ["1.19.0", "2.0.30"]) {
+  test(`OpenCode ${version} recovers reasoning-only output through Pi tools`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-reasoning-recovery-"));
+    const capture = join(dir, "calls.jsonl");
+    const sessionId = `pi-reasoning-${version}`;
+    const events: AssistantMessageEvent[] = [];
+    try {
+      await withFakeOpenCode(recoveryScript(capture, nativeRecoveryEvents, reasoningOnlyEvents), async () => {
+        const stream = streamOpenCode(fakeModel(), userContext(["Fetch the page"], ["bash"]), { sessionId });
+        for await (const event of stream) events.push(event);
+        const message = await stream.result();
+        assert.equal(message.stopReason, "toolUse", message.errorMessage);
+        assert.deepEqual(message.content.map(c => c.type === "toolCall" ? { name: c.name, arguments: c.arguments } : c), [
+          { name: "bash", arguments: { command: "rg needle ." } },
+        ]);
+        assert.equal(message.usage.input, 9);
+        assert.equal(message.usage.output, 6);
+        assert.equal(message.usage.totalTokens, 15);
+        assert.equal(events.filter(e => e.type === "start").length, 1);
+        assert.equal(events.filter(e => e.type === "done").length, 1);
+        assert.equal(events.some(e => e.type === "thinking_delta" || e.type === "error"), false);
+        const calls = readInvocations(capture);
+        assert.equal(calls.length, 2);
+        assert.equal(calls[1]!.args.includes("--session"), false);
+        assert.match(calls[1]!.stdin, /Fetch the page/);
+        assert.match(calls[1]!.stdin, /reasoning only/);
+        assert.match(calls[1]!.stdin, /Available Pi tools: bash/);
 
-  assert.equal(message.stopReason, "stop");
-  assert.equal(message.errorMessage, undefined);
-  const thinkingBlock = message.content.find(
-    (block) => block.type === "thinking",
-  );
-  assert.equal(thinkingBlock?.thinking, "thinking it through");
-  assert.equal(
-    message.content.some((block) => block.type === "text"),
-    false,
-  );
+        const next = await streamOpenCode(fakeModel(), userContext(["Fetch the page", "Next question"], ["bash"]), { sessionId }).result();
+        assert.equal(next.stopReason, "toolUse", next.errorMessage);
+        const nextCall = readInvocations(capture)[2]!;
+        assert.equal(nextCall.args.includes("--session"), false);
+        assert.match(nextCall.stdin, /Next question/);
+        assert.doesNotMatch(nextCall.stdin, /Your previous attempt/);
+      }, version);
+    } finally {
+      await cleanupPiSessionState(sessionId);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("reasoning-only recovery can answer without Pi tools", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-reasoning-answer-"));
+  const capture = join(dir, "calls.jsonl");
+  try {
+    const message = await withFakeOpenCode(recoveryScript(capture, [
+      { type: "text", part: { text: "Here is the answer." } },
+    ], reasoningOnlyEvents), () => streamOpenCode(fakeModel(), fakeContext()).result());
+    assert.equal(message.stopReason, "stop", message.errorMessage);
+    assert.deepEqual(message.content, [{ type: "text", text: "Here is the answer." }]);
+    assert.equal(readInvocations(capture).length, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
+
+for (const [first, second] of [
+  [reasoningOnlyEvents, reasoningOnlyEvents],
+  [reasoningOnlyEvents, [{ type: "tool_use", part: { tool: "grep", state: { input: { pattern: "needle" } } } }]],
+  [undefined, reasoningOnlyEvents],
+] as const) {
+  test(`reasoning-only and blocked-native failures share one recovery attempt (${first ? "reasoning" : "native"} to ${second === reasoningOnlyEvents ? "reasoning" : "native"})`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-reasoning-repeat-"));
+    const capture = join(dir, "calls.jsonl");
+    try {
+      const message = await withFakeOpenCode(recoveryScript(capture, [...second], first && [...first]), () =>
+        streamOpenCode(fakeModel(), fakeContext(["bash"])).result());
+      assert.equal(message.stopReason, "error");
+      assert.match(message.errorMessage ?? "", /after one recovery attempt/);
+      assert.doesNotMatch(message.errorMessage ?? "", /<pi_tool_call>/);
+      assert.equal(message.content.some(c => c.type === "text"), true);
+      assert.equal(readInvocations(capture).length, 2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+for (const boundary of ["cancellation", "deadline"] as const) {
+  test(`reasoning-only recovery does not retry after ${boundary}`, async t => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-reasoning-budget-"));
+    const capture = join(dir, "calls.jsonl");
+    const controller = new AbortController();
+    const now = Date.now.bind(Date);
+    let elapsed = 0;
+    t.mock.method(Date, "now", () => now() + elapsed);
+    try {
+      const message = await withFakeOpenCode(recoveryScript(capture, nativeRecoveryEvents, reasoningOnlyEvents), () =>
+        streamOpenCode(fakeModel(), fakeContext(["bash"]), {
+          signal: controller.signal,
+          timeoutMs: 10_000,
+          onProviderStreamEvent: event => {
+            if ((event as { type: string }).type !== "step_finish") return;
+            if (boundary === "cancellation") controller.abort();
+            else elapsed = 100_000;
+          },
+        }).result());
+      assert.equal(message.stopReason, boundary === "cancellation" ? "aborted" : "error");
+      assert.equal(readInvocations(capture).length, 1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
 
 test("streamOpenCode returns the expected error outcome when opencode times out", async () => {
   const message = await withFakeOpenCode(

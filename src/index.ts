@@ -1518,7 +1518,7 @@ function streamOpenCodeAttempt(
   model: Model<Api>,
   context: Context,
   options: SimpleStreamOptions | undefined,
-  allowNativeRecovery: boolean,
+  allowRecovery: boolean,
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
   const deadline = Date.now() + resolveTurnTimeoutMs(options?.timeoutMs);
@@ -1543,7 +1543,7 @@ function streamOpenCodeAttempt(
     let stdoutRemainder = "";
     let capturedSessionId: string | undefined;
     let opencodeToolUse: string | undefined;
-    let nativeToolFailure: Error | undefined;
+    let recoverableFailure: Error | undefined;
     // Text after the last blocked native call shows whether the model recovered in-run.
     let nativeTextMark = 0;
     let stepNativeCalls: (ParsedToolCall | undefined)[] = [];
@@ -1767,10 +1767,10 @@ function streamOpenCodeAttempt(
       }
       if (opencodeError) throw new Error(opencodeError);
       if (opencodeToolUse && !nativeCalls && !accumulatedText.slice(nativeTextMark).trim()) {
-        nativeToolFailure = new Error(
-          `OpenCode could not use the available Pi tools${allowNativeRecovery ? "" : " after one recovery attempt"} (blocked native tool: ${JSON.stringify(opencodeToolUse)}). Retry the request or select another OpenCode model.`,
+        recoverableFailure = new Error(
+          `OpenCode could not use the available Pi tools${allowRecovery ? "" : " after one recovery attempt"} (blocked native tool: ${JSON.stringify(opencodeToolUse)}). Retry the request or select another OpenCode model.`,
         );
-        throw nativeToolFailure;
+        throw recoverableFailure;
       }
 
       const toolCallResult = parseToolCallResponse(
@@ -1814,6 +1814,12 @@ function streamOpenCodeAttempt(
             `OpenCode attempted to use its disabled native tool (${JSON.stringify(xmlTool)}). This bridge only accepts <pi_tool_call>{"name":"...","arguments":{}}</pi_tool_call> markers. Do not use XML-style tool-use syntax.`,
           );
         }
+      }
+      if (toolCalls.length === 0 && !displayText.trim() && accumulatedThinking.trim()) {
+        recoverableFailure = new Error(
+          `OpenCode returned only reasoning without an answer or Pi tool call${allowRecovery ? "" : " after one recovery attempt"}. Retry the request or select another OpenCode model.`,
+        );
+        throw recoverableFailure;
       }
       if (
         toolCalls.length === 0 &&
@@ -1943,12 +1949,14 @@ function streamOpenCodeAttempt(
       deleteOpenCodeSession(capturedSessionId);
       if (piState) dropOpencodeSession(piState);
       const remainingMs = deadline - Date.now();
-      if (nativeToolFailure && error === nativeToolFailure && allowNativeRecovery &&
-          !options?.signal?.aborted && remainingMs > 0 && context.tools?.length) {
+      if (recoverableFailure && error === recoverableFailure && allowRecovery &&
+          !options?.signal?.aborted && remainingMs > 0 && (!opencodeToolUse || context.tools?.length)) {
         setEstimatedUsage(model, output, prompt, accumulatedText + accumulatedThinking);
         const correction = [
-          `Your previous attempt used the disabled OpenCode native tool ${JSON.stringify(opencodeToolUse)}.`,
-          `Available Pi tools: ${context.tools.map(tool => tool.name).join(", ")}.`,
+          opencodeToolUse
+            ? `Your previous attempt used the disabled OpenCode native tool ${JSON.stringify(opencodeToolUse)}.`
+            : "Your previous attempt ended with reasoning only, without an answer or Pi tool call. Provide a final answer or request a Pi tool, not just a plan to act.",
+          `Available Pi tools: ${context.tools?.map(tool => tool.name).join(", ") || "none"}.`,
           "Complete the original request using only those Pi tools. Do not call any OpenCode native tool.",
           'Request Pi tools as <pi_tool_call>{"name":"tool_name","arguments":{}}</pi_tool_call> markers, or answer normally if no tool is needed.',
           "If Pi has no grep tool, request a search through Pi bash when it is available instead.",
