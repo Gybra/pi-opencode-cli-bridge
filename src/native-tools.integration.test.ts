@@ -1,5 +1,5 @@
 // Runs the real OpenCode CLI against a local OpenAI-compatible fixture that asks
-// for native side effects. Needs OpenCode 1.19.0: set OPENCODE_PI_INTEGRATION_BIN
+// for native side effects. Needs OpenCode 1.19.0 or 2.0.30: set OPENCODE_PI_INTEGRATION_BIN
 // or put `opencode` on PATH. No network access or credentials are used.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -14,8 +14,10 @@ import { validateToolCall } from "@earendil-works/pi-ai";
 import type { Api, Model, Tool } from "@earendil-works/pi-ai";
 import { cleanupPiSessionState, streamOpenCode } from "./index.js";
 
-const OPENCODE_VERSION = "1.19.0";
 const realBin = process.env.OPENCODE_PI_INTEGRATION_BIN || "opencode";
+const version = /\d+\.\d+\.\d+/.exec(execFileSync(realBin, ["--version"], { encoding: "utf8" }))?.[0];
+const isV2 = version?.startsWith("2.") === true;
+const shellTool = isV2 ? "shell" : "bash";
 
 type Recorded = { tools: string[]; toolResults: string[] };
 
@@ -44,8 +46,8 @@ async function startFixture() {
     res.writeHead(200, { "content-type": "text/event-stream" });
     if (tools.includes("write") && toolResults.length === 0) {
       send([{ index: 0, delta: { role: "assistant", tool_calls: [
-        { index: 0, id: "call_write", type: "function", function: { name: "write", arguments: JSON.stringify({ filePath: "write-sentinel.txt", content: "native write ran" }) } },
-        { index: 1, id: "call_bash", type: "function", function: { name: "bash", arguments: JSON.stringify({ command: "echo native bash ran > bash-sentinel.txt", description: "Write sentinel" }) } },
+        { index: 0, id: "call_write", type: "function", function: { name: "write", arguments: JSON.stringify({ [isV2 ? "path" : "filePath"]: "write-sentinel.txt", content: "native write ran" }) } },
+        { index: 1, id: "call_bash", type: "function", function: { name: shellTool, arguments: JSON.stringify({ command: "echo native bash ran > bash-sentinel.txt", description: "Write sentinel" }) } },
       ] }, finish_reason: null }]);
       send([{ index: 0, delta: {}, finish_reason: "tool_calls" }]);
     } else {
@@ -111,8 +113,7 @@ function isolatedEnv(home: string, port: number): Record<string, string> {
 }
 
 test("real OpenCode CLI version matches the pinned integration target", () => {
-  const version = execFileSync(realBin, ["--version"], { encoding: "utf8" }).trim();
-  assert.equal(version, OPENCODE_VERSION, `set OPENCODE_PI_INTEGRATION_BIN to OpenCode ${OPENCODE_VERSION}`);
+  assert.ok(version && ["1.19.0", "2.0.30"].includes(version), "set OPENCODE_PI_INTEGRATION_BIN to OpenCode 1.19.0 or 2.0.30");
 });
 
 // Pi's real tool schemas, so translated calls are checked against what Pi will validate.
@@ -135,7 +136,7 @@ async function runNativeScenario(mode: "intact" | "missing" | "failing", tools: 
     // Declarations stay on the request, and the fixture really asked for both calls.
     const first = fixture.requests.find((request) => request.tools.includes("write"));
     assert.ok(first, "native tool declarations were not sent to the model");
-    assert.ok(first.tools.includes("bash"));
+    assert.ok(first.tools.includes(shellTool));
     assert.equal(existsSync(join(project, "write-sentinel.txt")), false, "native write executed");
     assert.equal(existsSync(join(project, "bash-sentinel.txt")), false, "native bash executed");
     return { message, requests: fixture.requests };
@@ -166,7 +167,9 @@ for (const mode of ["intact", "missing", "failing"] as const) {
 test("without Pi equivalents the model gets the blocker's correction and the run continues", { timeout: 90_000 }, async () => {
   const { message, requests } = await runNativeScenario("intact", []);
   const correction = requests.find((request) => request.toolResults.length > 0)?.toolResults.join("\n") ?? "";
-  assert.match(correction, /disabled in the Pi bridge[\s\S]*<pi_tool_call>\{\\?"name\\?":/);
+  assert.match(correction, isV2
+    ? /cannot ask the user for permission|rejected|denied/i
+    : /disabled in the Pi bridge[\s\S]*<pi_tool_call>\{\\?"name\\?":/);
   assert.equal(message.stopReason, "stop", message.errorMessage);
   assert.deepEqual(message.content, [{ type: "text", text: "done" }]);
 });

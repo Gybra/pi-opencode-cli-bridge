@@ -5,6 +5,7 @@ export type ProcessOptions = {
   timeoutMs: number;
   input?: string | (() => string | Promise<string>);
   env?: NodeJS.ProcessEnv;
+  cwd?: string;
   signal?: AbortSignal;
   onStart?: () => void | Promise<void>;
   onStdout?: (chunk: string) => void | Promise<void>;
@@ -21,6 +22,7 @@ export async function runOpenCodeProcess(
   const child = spawn(executable, args, {
     stdio: ["pipe", "pipe", "pipe"],
     env: options.env,
+    cwd: options.cwd,
     // The npm launcher can spawn the native CLI; terminate that entire group.
     detached: process.platform !== "win32",
   });

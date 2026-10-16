@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdtempSync,
   readFileSync,
@@ -9,7 +10,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, win32 } from "node:path";
+import { basename, dirname, join, relative, win32 } from "node:path";
 import test from "node:test";
 import {
   createBashToolDefinition,
@@ -139,10 +140,11 @@ function restoreEnv(key: string, value: string | undefined): void {
 async function withFakeOpenCode<T>(
   script: string,
   run: () => Promise<T>,
+  version = "1.19.0",
 ): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), "opencode-pi-fake-bin-"));
   const binPath = join(dir, "opencode-fake.js");
-  writeFileSync(binPath, `#!/usr/bin/env node\n${script}`, "utf8");
+  writeFileSync(binPath, `#!/usr/bin/env node\nif (process.argv[2] === "--version") { console.log(${JSON.stringify(version)}); process.exit(0); }\n${script}`, "utf8");
   chmodSync(binPath, 0o755);
 
   const previousBin = process.env.OPENCODE_PI_BIN;
@@ -981,7 +983,7 @@ test("session_start warns when OpenCode is not the version the native-tool guard
     await withFakeOpenCode('process.stdout.write("opencode 9.9.9\\n");', async () => {
       await opencodePiExtension(recorder.extension);
       await recorder.run(ctx);
-    });
+    }, "opencode 9.9.9");
     const warnings = ctx.notifications.filter((n) => n.level === "warning");
     assert.equal(warnings.length, 1);
     assert.match(warnings[0]!.message, /OpenCode 9\.9\.9.*1\.19\.0/);
@@ -2289,4 +2291,115 @@ test("cleanupPiSessionState removes the project directory at teardown", async ()
     await cleanupPiSessionState(piSessionId);
     rmSync(captureDir, { recursive: true, force: true });
   }
+});
+
+const v2Model = {
+  id: "vision-free", modelID: "vision-free", providerID: "opencode", name: "Vision Free",
+  enabled: true, status: "active", capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+  variants: [{ id: "none", settings: {} }, { id: "high", settings: {} }, { id: "max", settings: {} }],
+  limit: { context: 1048576, output: 131072 }, cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }],
+};
+
+function v2DiscoveryScript(data: unknown): string {
+  return `const assert = require("node:assert/strict");
+assert.deepEqual(process.argv.slice(2), ["api", "--standalone", "get", "/api/model"]);
+console.log(${JSON.stringify(JSON.stringify({ location: { directory: "/fixture" }, data }))});`;
+}
+
+test("OpenCode 2 discovery reads metadata and excludes paid, tiered, disabled and foreign models", async () => {
+  const previous = process.env.OPENCODE_PI_MODELS;
+  delete process.env.OPENCODE_PI_MODELS;
+  try {
+    const { models, error } = await withFakeOpenCode(v2DiscoveryScript([
+      v2Model,
+      { ...v2Model, id: "paid-free", cost: [{ input: 1, output: 2 }] },
+      { ...v2Model, id: "tiered-free", cost: [{ input: 0, output: 0 }, { tier: { type: "context", size: 200000 }, input: 1, output: 2 }] },
+      { ...v2Model, id: "disabled-free", enabled: false },
+      { ...v2Model, id: "retired-free", status: "deprecated" },
+      { ...v2Model, providerID: "opencode-go" },
+      null,
+    ]), () => discoverModels(), "opencode v2.0.30");
+    assert.equal(error, undefined);
+    assert.deepEqual(models.map(m => m.id), ["opencode/vision-free"]);
+    assert.equal(models[0]?.reasoning, true);
+    assert.equal(models[0]?.image, true);
+    assert.equal(models[0]?.contextWindow, 1048576);
+    assert.equal(models[0]?.maxTokens, 131072);
+    assert.equal(models[0]?.thinkingLevelMap?.off, "none");
+    assert.equal(models[0]?.thinkingLevelMap?.xhigh, "max");
+  } finally { restoreEnv("OPENCODE_PI_MODELS", previous); }
+});
+
+test("OpenCode 2 forced discovery enriches explicit paid models", async () => {
+  const previous = process.env.OPENCODE_PI_MODELS;
+  process.env.OPENCODE_PI_MODELS = "opencode/vision-free";
+  try {
+    const { models, error } = await withFakeOpenCode(v2DiscoveryScript([
+      { ...v2Model, cost: [{ input: 3, output: 15, cache: { read: 0.3, write: 0 } }] },
+    ]), () => discoverModels({ forceDiscovery: true }), "2.0.30");
+    assert.equal(error, undefined);
+    assert.deepEqual(models[0]?.cost, { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 0 });
+    assert.equal(models[0]?.image, true);
+  } finally { restoreEnv("OPENCODE_PI_MODELS", previous); }
+});
+
+test("OpenCode 2 run uses the isolated cwd, standalone server and model variant syntax", async () => {
+  const message = await withFakeOpenCode(`
+const assert = require("node:assert/strict"), path = require("node:path");
+assert.deepEqual(process.argv.slice(2), ["run", "-m", "opencode/fake-free#max", "--agent", "pi-model", "--format", "json", "--standalone", "--thinking"]);
+assert.equal(process.cwd(), require("node:fs").realpathSync(process.env.PWD));
+assert.equal(process.cwd(), require("node:fs").realpathSync(path.dirname(process.env.OPENCODE_CONFIG_DIR)));
+process.stdout.write(JSON.stringify({ type: "text", part: { text: "v2 reply" } }) + "\\n");
+`, () => streamOpenCode({ ...fakeModel(), thinkingLevelMap: { xhigh: "max" } }, fakeContext(), { reasoning: "xhigh" }).result(), "opencode v2.0.30");
+  assert.equal(message.stopReason, "stop", message.errorMessage);
+  assert.deepEqual(message.content, [{ type: "text", text: "v2 reply" }]);
+});
+
+for (const executable of ["relative", "PATH"] as const) {
+  test(`OpenCode 2 launches a configured ${executable} executable from its isolated project`, async () => {
+    const previousPath = process.env.PATH;
+    const dir = mkdtempSync(join(process.cwd(), ".opencode-pi-bin-"));
+    try {
+      const message = await withFakeOpenCode(fakeEventScript([
+        { type: "text", part: { text: "configured executable ran" } },
+      ]), async () => {
+        const bin = join(dir, "opencode.js");
+        copyFileSync(process.env.OPENCODE_PI_BIN!, bin);
+        chmodSync(bin, 0o755);
+        if (executable === "relative") {
+          process.env.OPENCODE_PI_BIN = relative(process.cwd(), bin);
+        } else {
+          process.env.OPENCODE_PI_BIN = basename(bin);
+          process.env.PATH = `${dirname(bin)}${process.platform === "win32" ? ";" : ":"}${previousPath ?? ""}`;
+        }
+        return streamOpenCode(fakeModel(), fakeContext()).result();
+      }, "opencode v2.0.30");
+      assert.equal(message.stopReason, "stop", message.errorMessage);
+      assert.deepEqual(message.content, [{ type: "text", text: "configured executable ran" }]);
+    } finally {
+      restoreEnv("PATH", previousPath);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("OpenCode 2 shell calls translate to Pi bash without dropping unsupported execution options", () => {
+  const translate = (input: unknown) => translateNativeToolCall("shell", input, new Set(["bash"]), ["/tmp/project"]);
+  assert.deepEqual(translate({ command: "npm test", timeout: 1501 }), { name: "bash", arguments: { command: "npm test", timeout: 2 } });
+  assert.equal(translate({ command: "npm test", background: true }), undefined);
+  assert.equal(translate({ command: "npm test", cwd: "/other" }), undefined);
+  assert.equal(translate({ command: "npm test", timeout: 0 }), undefined);
+});
+
+test("session_start accepts the verified OpenCode 2 version", async () => {
+  const previous = process.env.OPENCODE_PI_MODELS;
+  process.env.OPENCODE_PI_MODELS = "big-pickle";
+  try {
+    const recorder = sessionStartRecorder(), ctx = recordingCtx();
+    await withFakeOpenCode("", async () => {
+      await opencodePiExtension(recorder.extension);
+      await recorder.run(ctx);
+    }, "opencode v2.0.30");
+    assert.deepEqual(ctx.notifications.filter(n => n.level === "warning"), []);
+  } finally { restoreEnv("OPENCODE_PI_MODELS", previous); }
 });

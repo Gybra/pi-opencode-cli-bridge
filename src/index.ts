@@ -2,7 +2,7 @@ import { runOpenCodeProcess } from "./process.js";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, posix, win32 } from "node:path";
+import { dirname, join, posix, resolve, win32 } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerApiProvider } from "@earendil-works/pi-ai/compat";
 import {
@@ -29,8 +29,14 @@ import {
 const PROVIDER_ID = "opencode-cli";
 const API_ID = "opencode-cli-runner";
 const AGENT_ID = "pi-model";
-// The native-tool guard is verified against this CLI release by the integration test.
-const VERIFIED_OPENCODE_VERSION = "1.19.0";
+// Only exact releases exercised by the real-CLI native-side-effect tests belong here.
+const VERIFIED_OPENCODE_VERSIONS = ["1.19.0", "2.0.30"];
+const cliVersions = new Map<string, string | undefined>();
+
+async function usesV2Cli(): Promise<boolean> {
+  if (!cliVersions.has(opencodeBin())) await checkCliStatus();
+  return cliVersions.get(opencodeBin())?.startsWith("2.") === true;
+}
 const DEFAULT_CONTEXT_WINDOW = 128_000;
 const DEFAULT_MAX_TOKENS = 16_384;
 const DISCOVERY_TIMEOUT_MS = 8_000;
@@ -110,7 +116,11 @@ let lastDiscoveryError: string | undefined;
 
 function opencodeBin(): string {
   const configured = process.env.OPENCODE_PI_BIN?.trim();
-  if (configured) return configured;
+  if (configured) {
+    return configured.includes("/") || configured.includes("\\")
+      ? resolve(configured)
+      : configured;
+  }
   if (process.platform === "win32") {
     // npm's `opencode.cmd` shim cannot be launched by spawn() without a shell.
     // Resolve the native executable installed beside the active Node runtime.
@@ -310,49 +320,83 @@ export function parseVerboseModels(output: string): OpenCodeModelInfo[] {
     }
     if (typeof metadata !== "object" || metadata === null) continue;
 
-    const value = metadata as {
-      name?: unknown;
-      status?: unknown;
-      cost?: {
-        input?: unknown;
-        output?: unknown;
-        cache?: { read?: unknown; write?: unknown };
-      };
-      limit?: { context?: unknown; output?: unknown };
-      capabilities?: { reasoning?: unknown; input?: { image?: unknown } };
-      variants?: unknown;
-    };
-    const reasoning = value.capabilities?.reasoning === true;
-    const cost = parseModelCost(value);
-    const costFromMetadata =
-      costFigure(value.cost?.input) !== undefined &&
-      costFigure(value.cost?.output) !== undefined;
-    const status =
-      typeof value.status === "string" && value.status.trim()
-        ? value.status.trim()
-        : undefined;
-    records.set(id, {
-      id,
-      name:
-        typeof value.name === "string" && value.name.trim()
-          ? value.name.trim()
-          : modelDisplayName(id),
-      reasoning,
-      image: value.capabilities?.input?.image === true,
-      contextWindow: positiveNumber(
-        value.limit?.context,
-        contextWindowFor(id),
-      ),
-      maxTokens: positiveNumber(value.limit?.output, maxTokensFor(id)),
-      cost,
-      ...(costFromMetadata ? { costFromMetadata: true as const } : {}),
-      ...(status !== undefined ? { status } : {}),
-      ...(reasoning
-        ? { thinkingLevelMap: thinkingLevelMap(value.variants) }
-        : {}),
-    });
+    records.set(id, modelInfo(id, metadata));
   }
   return [...records.values()];
+}
+
+function modelInfo(id: string, metadata: unknown): OpenCodeModelInfo {
+  const value = metadata as {
+    name?: unknown;
+    status?: unknown;
+    cost?: {
+      input?: unknown;
+      output?: unknown;
+      cache?: { read?: unknown; write?: unknown };
+    };
+    limit?: { context?: unknown; output?: unknown };
+    capabilities?: { reasoning?: unknown; input?: { image?: unknown } };
+    variants?: unknown;
+  };
+  const reasoning = value.capabilities?.reasoning === true;
+  const cost = parseModelCost(value);
+  const costFromMetadata =
+    costFigure(value.cost?.input) !== undefined &&
+    costFigure(value.cost?.output) !== undefined;
+  const status =
+    typeof value.status === "string" && value.status.trim()
+      ? value.status.trim()
+      : undefined;
+  return {
+    id,
+    name:
+      typeof value.name === "string" && value.name.trim()
+        ? value.name.trim()
+        : modelDisplayName(id),
+    reasoning,
+    image: value.capabilities?.input?.image === true,
+    contextWindow: positiveNumber(value.limit?.context, contextWindowFor(id)),
+    maxTokens: positiveNumber(value.limit?.output, maxTokensFor(id)),
+    cost,
+    ...(costFromMetadata ? { costFromMetadata: true as const } : {}),
+    ...(status !== undefined ? { status } : {}),
+    ...(reasoning ? { thinkingLevelMap: thinkingLevelMap(value.variants) } : {}),
+  };
+}
+
+/** V2 exposes model metadata through its local API, not `models --verbose`. */
+function parseV2Models(output: string): OpenCodeModelInfo[] {
+  const data = objectRecord(JSON.parse(output))?.data;
+  if (!Array.isArray(data)) return [];
+  return data.flatMap((entry) => {
+    const value = objectRecord(entry);
+    if (value?.providerID !== "opencode" || typeof value.id !== "string" ||
+        !value.id.trim() || /[\s/#]/.test(value.id) || value.enabled === false) return [];
+    const capabilities = objectRecord(value.capabilities);
+    const variants = Array.isArray(value.variants)
+      ? value.variants.flatMap((v) => typeof objectRecord(v)?.id === "string" ? [String(v.id)] : [])
+      : [];
+    const costs = Array.isArray(value.cost) ? value.cost : [];
+    // Any paid tier makes automatic selection unsafe, even when the base tier is free.
+    if (costs.some((c) => costFigure(objectRecord(c)?.input) === undefined ||
+        costFigure(objectRecord(c)?.output) === undefined)) return [];
+    const cost = costs.length ? {
+      input: Math.max(...costs.map(c => c.input)),
+      output: Math.max(...costs.map(c => c.output)),
+      cache: {
+        read: Math.max(...costs.map(c => costFigure(objectRecord(c.cache)?.read) ?? 0)),
+        write: Math.max(...costs.map(c => costFigure(objectRecord(c.cache)?.write) ?? 0)),
+      },
+    } : undefined;
+    return [modelInfo(`opencode/${value.id}`, {
+      ...value, cost,
+      capabilities: {
+        reasoning: variants.length > 0 || typeof objectRecord(value.compatibility)?.reasoningField === "string",
+        input: { image: Array.isArray(capabilities?.input) && capabilities.input.includes("image") },
+      },
+      variants: Object.fromEntries(variants.map(id => [id, {}])),
+    })];
+  });
 }
 
 function runCapture(
@@ -390,6 +434,7 @@ export async function checkCliStatus(): Promise<CliStatus> {
     }
     const version =
       result.stdout.trim() || result.stderr.trim() || "OpenCode CLI is available";
+    cliVersions.set(opencodeBin(), /\d+\.\d+\.\d+/.exec(version)?.[0]);
     return { ok: true, summary: version };
   } catch (error) {
     return {
@@ -425,7 +470,10 @@ export async function discoverModels(opts?: {
   }
 
   try {
-    const result = await runCapture(["models", "opencode", "--verbose"]);
+    const v2 = await usesV2Cli();
+    const result = await runCapture(v2
+      ? ["api", "--standalone", "get", "/api/model"]
+      : ["models", "opencode", "--verbose"]);
     if (result.code !== 0) {
       throw new Error(
         result.stderr.trim() ||
@@ -433,9 +481,9 @@ export async function discoverModels(opts?: {
       );
     }
 
-    const metadata = parseVerboseModels(result.stdout);
+    const metadata = v2 ? parseV2Models(result.stdout) : parseVerboseModels(result.stdout);
     if (metadata.length === 0) {
-      throw new Error("opencode verbose model discovery returned no metadata");
+      throw new Error("opencode model discovery returned no metadata");
     }
     const byId = new Map(metadata.map((model) => [model.id, model]));
     const selected = configured?.length
@@ -444,7 +492,7 @@ export async function discoverModels(opts?: {
           (model) => isActiveModel(model.status) && isFreeModel(model),
         );
     if (selected.length === 0) {
-      throw new Error("opencode verbose model discovery returned no free models");
+      throw new Error("opencode model discovery returned no free models");
     }
 
     lastDiscoveryError = undefined;
@@ -642,31 +690,36 @@ export function translateNativeToolCall(
     name,
     arguments: Object.fromEntries(Object.entries(entries).filter(([, v]) => v !== undefined)),
   });
+  const fileKey = text("filePath") !== undefined ? "filePath" : "path";
   let result: ParsedToolCall | undefined;
   switch (tool) {
-    case "bash": {
+    case "bash":
+    case "shell": {
       // shortcut: absolute temp-project paths inside the command are not rewritten; parse them if models rely on it.
       const timeout = count("timeout");
-      if (text("command") === undefined || (args.workdir !== undefined && path("workdir") !== ".")) break;
+      if (text("command") === undefined ||
+          (args.workdir !== undefined && path("workdir") !== ".") ||
+          (tool === "shell" && (args.background === true || args.timeout === 0 ||
+            (args.cwd !== undefined && path("cwd") !== ".")))) break;
       result = call("bash", { command: text("command"), timeout: timeout && Math.ceil(timeout / 1000) });
       break;
     }
     case "read":
-      if (text("filePath") !== undefined) {
-        result = call("read", { path: path("filePath"), offset: count("offset"), limit: count("limit") });
+      if (text(fileKey) !== undefined) {
+        result = call("read", { path: path(fileKey), offset: count("offset"), limit: count("limit") });
       }
       break;
     case "write":
-      if (text("filePath") !== undefined && text("content") !== undefined) {
-        result = call("write", { path: path("filePath"), content: text("content") });
+      if (text(fileKey) !== undefined && text("content") !== undefined) {
+        result = call("write", { path: path(fileKey), content: text("content") });
       }
       break;
     case "edit":
       // Pi edits need one unique, non-empty match: no replaceAll or create-by-edit.
-      if (text("filePath") !== undefined && text("oldString") && text("newString") !== undefined &&
+      if (text(fileKey) !== undefined && text("oldString") && text("newString") !== undefined &&
           args.replaceAll !== true) {
         result = call("edit", {
-          path: path("filePath"),
+          path: path(fileKey),
           edits: [{ oldText: text("oldString"), newText: text("newString") }],
         });
       }
@@ -1264,7 +1317,9 @@ const pendingSessionDeletions = new Set<Promise<void>>();
 /** Best-effort, bounded deletion; shutdown also awaits one-shot deletions. */
 export function deleteOpenCodeSession(sessionId: string | undefined): Promise<void> {
   if (!sessionId) return Promise.resolve();
-  const task = runCapture(["session", "delete", sessionId], undefined, SESSION_DELETE_TIMEOUT_MS)
+  const args = ["session", "delete", sessionId];
+  if (cliVersions.get(opencodeBin())?.startsWith("2.")) args.push("--standalone");
+  const task = runCapture(args, undefined, SESSION_DELETE_TIMEOUT_MS)
     .then(() => undefined, () => undefined);
   pendingSessionDeletions.add(task);
   void task.finally(() => pendingSessionDeletions.delete(task));
@@ -1437,8 +1492,8 @@ You are the OpenCode side of a Pi Coding Agent bridge. Do not use OpenCode nativ
   // the request. Permission `deny` removes them before inference and is now
   // rejected as a third-party client. Keep declarations intact, but block
   // every native execution before side effects occur. The agent's `ask`
-  // permission keeps declarations too, and `opencode run` auto-rejects asks,
-  // so a plugin that fails to load still cannot run native tools.
+  // permission keeps declarations too, and `opencode run` auto-rejects asks.
+  // V2 relies on that permission guard; the legacy plugin only guards V1.
   await writeFile(
     join(pluginsDir, "pi-native-tool-blocker.js"),
     `export const PiNativeToolBlocker = async () => ({
@@ -1544,26 +1599,24 @@ export function streamOpenCode(
       );
       const imagePaths = await writeImageFiles(images, sessionDir);
       if (options?.signal?.aborted) throw new Error("Request was aborted");
+      const v2 = await usesV2Cli();
+      const requestedReasoning = options?.reasoning as ModelThinkingLevel | undefined;
+      const variant = requestedReasoning && requestedReasoning !== "off"
+        ? model.thinkingLevelMap?.[requestedReasoning] : undefined;
       const args = [
         "run",
         "-m",
-        model.id,
+        v2 && typeof variant === "string" && variant.trim() ? `${model.id}#${variant}` : model.id,
         "--agent",
         AGENT_ID,
         "--format",
         "json",
-        "--dir",
-        sessionDir,
+        ...(v2 ? ["--standalone"] : ["--dir", sessionDir]),
       ];
       if (isContinuation && piState?.opencodeSessionId) {
         args.push("--session", piState.opencodeSessionId);
       }
-      const requestedReasoning = options?.reasoning as
-        | ModelThinkingLevel
-        | undefined;
-      args.push(
-        ...reasoningCliArgs(requestedReasoning, model.thinkingLevelMap),
-      );
+      args.push(...reasoningCliArgs(requestedReasoning, v2 ? undefined : model.thinkingLevelMap));
       for (const path of imagePaths) args.push("--file", path);
 
       const handleLine = async (line: string) => {
@@ -1658,6 +1711,7 @@ export function streamOpenCode(
       };
 
       const result = await runOpenCodeProcess(opencodeBin(), args, {
+        cwd: v2 ? sessionDir : undefined,
         input: async () => {
           if (!payloadHook) return prompt;
           const replacement = await payloadHook({ prompt }, model);
@@ -1678,6 +1732,7 @@ export function streamOpenCode(
         env: {
           ...process.env,
           ...options?.env,
+          ...(v2 ? { PWD: sessionDir } : {}),
           OPENCODE_DISABLE_UPDATE_CHECK: "1",
           OPENCODE_CONFIG_DIR: join(sessionDir, ".opencode"),
         },
@@ -1998,9 +2053,9 @@ export default async function opencodePiExtension(pi: ExtensionAPI) {
       "info",
     );
     const version = /\d+\.\d+\.\d+/.exec(cliStatus.summary)?.[0];
-    if (version !== VERIFIED_OPENCODE_VERSION) {
+    if (!version || !VERIFIED_OPENCODE_VERSIONS.includes(version)) {
       ctx.ui.notify(
-        `opencode-pi: OpenCode ${version ?? cliStatus.summary} is not ${VERIFIED_OPENCODE_VERSION}, the version the native-tool guard was verified with. Native OpenCode tools may not stay blocked.`,
+        `opencode-pi: OpenCode ${version ?? cliStatus.summary} is not one of ${VERIFIED_OPENCODE_VERSIONS.join(", ")}, the versions the native-tool guard was verified with. Native OpenCode tools may not stay blocked.`,
         "warning",
       );
     }
