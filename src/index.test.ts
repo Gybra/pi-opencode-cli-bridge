@@ -1071,6 +1071,78 @@ for (const boundary of ["cancellation", "deadline"] as const) {
   });
 }
 
+for (const version of ["1.19.0", "2.0.30"]) {
+  for (const outcome of ["alternative", "clarification", "unavailable"] as const) {
+    test(`OpenCode ${version} forwards blocked native requests for functional recovery (${outcome})`, async () => {
+      const dir = mkdtempSync(join(tmpdir(), "pi-native-alternative-"));
+      const capture = join(dir, "calls.jsonl");
+      const sessionId = `pi-alternative-${version}-${outcome}`;
+      const firstUrl = 'https://example.com/proposal?title="demo"';
+      const secondUrl = "https://example.com/appendix";
+      const tools = [outcome === "alternative" ? {
+        name: "inspect_document",
+        description: "Read the full document at the URL supplied in path; not a search engine.",
+        parameters: createReadToolDefinition(process.cwd()).parameters,
+      } : {
+        name: "webfetch_search",
+        description: "Search an index for snippets only. Cannot retrieve a URL or read a full page.",
+        parameters: createGrepToolDefinition(process.cwd()).parameters,
+      }];
+      const context: Context = { ...userContext(["Inspect the proposed documents"]), tools };
+      const reply = outcome === "clarification"
+        ? "No suitable tool can read these pages. Please paste their content."
+        : outcome === "unavailable"
+          ? '<pi_tool_call>{"name":"webfetch","arguments":{"url":"https://example.com/proposal"}}</pi_tool_call>'
+          : [firstUrl, secondUrl].map(path => `<pi_tool_call>${JSON.stringify({ name: "inspect_document", arguments: { path } })}</pi_tool_call>`).join("\n");
+      try {
+        await withFakeOpenCode(recoveryScript(capture, [
+          { type: "text", part: { text: reply } },
+          { type: "step_finish", part: { tokens: { total: 5, input: 3, output: 2 } } },
+        ], [
+          { type: "tool_use", part: { tool: "webfetch", state: { input: { url: firstUrl, format: "markdown" } } } },
+          { type: "tool_use", part: { tool: "webfetch", state: { input: { url: secondUrl, format: "text" } } } },
+          { type: "step_finish", part: { tokens: { total: 10, input: 6, output: 4 } } },
+        ]), async () => {
+          const message = await streamOpenCode(fakeModel(), context, { sessionId }).result();
+          assert.equal(message.stopReason, outcome === "alternative" ? "toolUse" : outcome === "clarification" ? "stop" : "error", message.errorMessage);
+          if (outcome === "alternative") {
+            const calls = message.content.filter(c => c.type === "toolCall");
+            assert.deepEqual(calls.map(c => ({ name: c.name, arguments: c.arguments })), [
+              { name: "inspect_document", arguments: { path: firstUrl } },
+              { name: "inspect_document", arguments: { path: secondUrl } },
+            ]);
+            for (const call of calls) validateToolArguments(tools[0]!, call);
+          } else if (outcome === "clarification") {
+            assert.deepEqual(message.content, [{ type: "text", text: reply }]);
+          } else {
+            assert.match(message.errorMessage ?? "", /unavailable Pi tool "webfetch"/);
+            assert.equal(message.content.some(c => c.type === "toolCall"), false);
+          }
+          assert.equal(message.usage.totalTokens, 15);
+          const invocations = readInvocations(capture);
+          assert.equal(invocations.length, 2);
+          assert.equal(invocations[1]!.args.includes("--session"), false);
+          const correction = invocations[1]!.stdin.slice(invocations[1]!.stdin.indexOf("Your previous attempt"));
+          assert.ok(correction.includes(JSON.stringify(firstUrl)), "first native request arguments were lost");
+          assert.ok(correction.includes(JSON.stringify(secondUrl)), "second native request arguments were lost");
+          assert.match(correction, /"format": "markdown"/);
+          assert.match(correction, /"format": "text"/);
+          assert.ok(invocations[1]!.stdin.includes(tools[0]!.description));
+          assert.match(invocations[1]!.stdin, /"properties"/);
+          assert.ok(invocations[1]!.stdin.includes(tools[0]!.name));
+          await streamOpenCode(fakeModel(), { ...context, messages: [...context.messages, { role: "user", content: "Next question", timestamp: 2 }] }, { sessionId }).result();
+          const next = readInvocations(capture)[2]!;
+          assert.doesNotMatch(next.stdin, /Your previous attempt/);
+          assert.equal(next.stdin.includes(secondUrl), false, "native-call arguments leaked into the next Pi turn");
+        }, version);
+      } finally {
+        await cleanupPiSessionState(sessionId);
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  }
+}
+
 test("native-tool recovery stops after one attempt", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-native-repeat-"));
   const capture = join(dir, "calls.jsonl");
@@ -1103,15 +1175,16 @@ test("malformed-call recovery does not retry unavailable Pi tools", async () => 
   }
 });
 
-test("native-tool recovery is skipped when Pi exposes no tools", async () => {
+test("native-tool recovery can ask for content when Pi exposes no tools", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-native-no-tools-"));
   const capture = join(dir, "calls.jsonl");
   try {
-    const message = await withFakeOpenCode(recoveryScript(capture, nativeRecoveryEvents), () =>
-      streamOpenCode(fakeModel(), fakeContext()).result());
-    assert.equal(message.stopReason, "error");
-    assert.doesNotMatch(message.errorMessage ?? "", /after one recovery attempt/);
-    assert.equal(readInvocations(capture).length, 1);
+    const message = await withFakeOpenCode(recoveryScript(capture, [
+      { type: "text", part: { text: "No suitable tool is available. Please paste the page content." } },
+    ]), () => streamOpenCode(fakeModel(), fakeContext()).result());
+    assert.equal(message.stopReason, "stop", message.errorMessage);
+    assert.deepEqual(message.content, [{ type: "text", text: "No suitable tool is available. Please paste the page content." }]);
+    assert.equal(readInvocations(capture).length, 2);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

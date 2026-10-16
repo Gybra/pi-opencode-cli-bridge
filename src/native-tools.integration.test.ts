@@ -9,7 +9,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { createBashToolDefinition, createWriteToolDefinition } from "@earendil-works/pi-coding-agent";
+import { createBashToolDefinition, createReadToolDefinition, createWriteToolDefinition } from "@earendil-works/pi-coding-agent";
 import { validateToolCall } from "@earendil-works/pi-ai";
 import type { Api, Model, SimpleStreamOptions, Tool } from "@earendil-works/pi-ai";
 import { cleanupPiSessionState, streamOpenCode } from "./index.js";
@@ -20,14 +20,16 @@ const isV2 = version?.startsWith("2.") === true;
 const shellTool = isV2 ? "shell" : "bash";
 
 type Recorded = { tools: string[]; toolResults: string[]; messages: string };
-type Scenario = "side-effects" | "grep-recovery" | "reasoning-recovery" | "reasoning-answer" | "mixed-dsml" | "invalid-json";
+type Scenario = "side-effects" | "grep-recovery" | "reasoning-recovery" | "reasoning-answer" | "mixed-dsml" | "invalid-json" | "native-alternative" | "native-no-alternative";
 
 /** OpenAI-compatible SSE fixture for blocked native calls and Pi-tool recovery. */
 async function startFixture(scenario: Scenario) {
   const requests: Recorded[] = [];
+  const nativeFetches: string[] = [];
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     let body = "";
     for await (const chunk of req) body += chunk;
+    if (req.url?.startsWith("/native-web-sentinel")) nativeFetches.push(req.url);
     if (req.method !== "POST" || !req.url?.endsWith("/chat/completions")) {
       res.writeHead(404).end();
       return;
@@ -46,7 +48,23 @@ async function startFixture(scenario: Scenario) {
     const base = { id: "chatcmpl-fixture", object: "chat.completion.chunk", created: 1, model: "model" };
     const send = (choices: unknown[]) => res.write(`data: ${JSON.stringify({ ...base, choices })}\n\n`);
     res.writeHead(200, { "content-type": "text/event-stream" });
-    if ((scenario === "mixed-dsml" || scenario === "invalid-json") && tools.includes("write")) {
+    if ((scenario === "native-alternative" || scenario === "native-no-alternative") && tools.includes("webfetch")) {
+      const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/native-web-sentinel`;
+      if (messages.includes("Your previous attempt used the disabled OpenCode native tool") && messages.includes(url)) {
+        const content = scenario === "native-alternative"
+          ? `<pi_tool_call>${JSON.stringify({ name: "inspect_document", arguments: { path: url } })}</pi_tool_call>`
+          : "No suitable Pi tool can read this page. Please paste the content.";
+        send([{ index: 0, delta: { role: "assistant", content }, finish_reason: null }]);
+        send([{ index: 0, delta: {}, finish_reason: "stop" }]);
+      } else if (toolResults.length === 0) {
+        send([{ index: 0, delta: { role: "assistant", tool_calls: [
+          { index: 0, id: "call_fetch", type: "function", function: { name: "webfetch", arguments: JSON.stringify({ url, format: "markdown" }) } },
+        ] }, finish_reason: null }]);
+        send([{ index: 0, delta: {}, finish_reason: "tool_calls" }]);
+      } else {
+        send([{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: "stop" }]);
+      }
+    } else if ((scenario === "mixed-dsml" || scenario === "invalid-json") && tools.includes("write")) {
       const content = messages.includes("Your previous attempt returned a malformed Pi tool call")
         ? '<pi_tool_call>{"name":"bash","arguments":{"command":"rg needle ."}}</pi_tool_call>'
         : scenario === "mixed-dsml"
@@ -88,7 +106,7 @@ async function startFixture(scenario: Scenario) {
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as AddressInfo).port;
-  return { requests, port, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
+  return { requests, nativeFetches, port, close: () => new Promise<void>((resolve) => server.close(() => resolve())) };
 }
 
 function fixtureModel(): Model<Api> {
@@ -176,6 +194,7 @@ async function runNativeScenario(mode: "intact" | "missing" | "failing", tools: 
     assert.ok(first.tools.includes(shellTool));
     assert.equal(existsSync(join(project, "write-sentinel.txt")), false, "native write executed");
     assert.equal(existsSync(join(project, "bash-sentinel.txt")), false, "native bash executed");
+    assert.equal(fixture.nativeFetches.length, 0, "native webfetch performed an HTTP request");
     return { message, requests: fixture.requests, observed };
   } finally {
     process.env.OPENCODE_PI_BIN = previousBin;
@@ -251,6 +270,29 @@ for (const scenario of ["mixed-dsml", "invalid-json"] as const) {
     assert.deepEqual(calls[0]!.arguments, { command: "rg needle ." });
     assert.equal(requests.filter(request => request.tools.includes("write")).length, 2);
     assert.ok(requests.some(request => request.messages.includes("Your previous attempt returned a malformed Pi tool call")));
+  });
+}
+
+for (const alternative of [true, false]) {
+  test(`blocked native webfetch recovers with ${alternative ? "a schema-compatible Pi alternative" : "a request for page content"}`, { timeout: 90_000 }, async () => {
+    const tools: Tool[] = alternative ? [{
+      name: "inspect_document",
+      description: "Read the full page at the URL supplied in path.",
+      parameters: createReadToolDefinition(process.cwd()).parameters,
+    }] : [];
+    const { message, requests } = await runNativeScenario("intact", tools, alternative ? "native-alternative" : "native-no-alternative");
+    assert.equal(message.stopReason, alternative ? "toolUse" : "stop", message.errorMessage);
+    assert.equal(requests.filter(request => request.tools.includes("write") && request.toolResults.length === 0).length, 2);
+    assert.ok(requests.some(request => request.messages.includes("Your previous attempt used the disabled OpenCode native tool")));
+    if (alternative) {
+      const calls = message.content.filter(c => c.type === "toolCall");
+      assert.equal(calls.length, 1);
+      validateToolCall(tools, calls[0]!);
+      assert.equal(calls[0]!.name, "inspect_document");
+      assert.match(String(calls[0]!.arguments.path), /^http:\/\/127\.0\.0\.1:\d+\/native-web-sentinel$/);
+    } else {
+      assert.deepEqual(message.content, [{ type: "text", text: "No suitable Pi tool can read this page. Please paste the content." }]);
+    }
   });
 }
 
