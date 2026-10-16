@@ -20,7 +20,7 @@ const isV2 = version?.startsWith("2.") === true;
 const shellTool = isV2 ? "shell" : "bash";
 
 type Recorded = { tools: string[]; toolResults: string[]; messages: string };
-type Scenario = "side-effects" | "grep-recovery";
+type Scenario = "side-effects" | "grep-recovery" | "reasoning-recovery";
 
 /** OpenAI-compatible SSE fixture for blocked native calls and Pi-tool recovery. */
 async function startFixture(scenario: Scenario) {
@@ -46,7 +46,13 @@ async function startFixture(scenario: Scenario) {
     const base = { id: "chatcmpl-fixture", object: "chat.completion.chunk", created: 1, model: "model" };
     const send = (choices: unknown[]) => res.write(`data: ${JSON.stringify({ ...base, choices })}\n\n`);
     res.writeHead(200, { "content-type": "text/event-stream" });
-    if (scenario === "grep-recovery" && tools.includes("grep")) {
+    if (scenario === "reasoning-recovery" && tools.includes("write")) {
+      const delta = messages.includes("Your previous attempt ended with reasoning only")
+        ? { role: "assistant", content: '<pi_tool_call>{"name":"bash","arguments":{"command":"curl -I https://example.com"}}</pi_tool_call>' }
+        : { role: "assistant", reasoning_content: "I should use Pi bash to fetch the page. Let me do that." };
+      send([{ index: 0, delta, finish_reason: null }]);
+      send([{ index: 0, delta: {}, finish_reason: "stop" }]);
+    } else if (scenario === "grep-recovery" && tools.includes("grep")) {
       if (messages.includes("Your previous attempt used the disabled OpenCode native tool")) {
         send([{ index: 0, delta: { role: "assistant", content: '<pi_tool_call>{"name":"bash","arguments":{"command":"rg needle ."}}</pi_tool_call>' }, finish_reason: null }]);
         send([{ index: 0, delta: {}, finish_reason: "stop" }]);
@@ -145,7 +151,12 @@ async function runNativeScenario(mode: "intact" | "missing" | "failing", tools: 
     const message = await streamOpenCode(fixtureModel(), {
       messages: [{ role: "user", content: "Use your native tools.", timestamp: 1 }],
       tools,
-    }, { sessionId, timeoutMs: 60_000, env: isolatedEnv(join(dir, "home"), fixture.port) }).result();
+    }, {
+      sessionId,
+      timeoutMs: 60_000,
+      reasoning: scenario === "reasoning-recovery" ? "high" : undefined,
+      env: isolatedEnv(join(dir, "home"), fixture.port),
+    }).result();
     const project = readFileSync(join(dir, "project-dir"), "utf8");
     // Declarations stay on the request, and the fixture really asked for both calls.
     const first = fixture.requests.find((request) => request.tools.includes("write"));
@@ -190,6 +201,19 @@ test("native grep stays blocked and recovers through Pi bash when Pi grep is una
   assert.ok(requests.some(request => request.messages.includes("Available Pi tools: bash")));
   const blocked = requests.flatMap(request => request.toolResults).join("\n");
   assert.match(blocked, /disabled in the Pi bridge|cannot ask the user for permission|rejected|denied/i);
+});
+
+test("reasoning-only output recovers as a Pi tool call instead of silently ending the turn", { timeout: 90_000 }, async () => {
+  const tools = piTools.filter(tool => tool.name === "bash");
+  const { message, requests } = await runNativeScenario("intact", tools, "reasoning-recovery");
+  assert.equal(message.stopReason, "toolUse", message.errorMessage);
+  const calls = message.content.filter(c => c.type === "toolCall");
+  assert.equal(calls.length, 1);
+  for (const call of calls) validateToolCall(tools, call);
+  assert.deepEqual(calls[0]!.arguments, { command: "curl -I https://example.com" });
+  assert.equal(calls[0]!.name, "bash");
+  assert.equal(requests.filter(request => request.tools.includes("write")).length, 2);
+  assert.ok(requests.some(request => request.messages.includes("Your previous attempt ended with reasoning only")));
 });
 
 test("without Pi equivalents the model gets the blocker's correction and the run continues", { timeout: 90_000 }, async () => {

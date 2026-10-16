@@ -123,6 +123,8 @@ Without an override, discovery selects active `opencode/` models whose reported 
 6. Text markers such as `<pi_tool_call>{"name":"read","arguments":{"path":"example.txt"}}</pi_tool_call>` become Pi tool calls. Tool names must be in the current Pi tool list; execution then follows Pi's normal validation and permission pipeline. DeepSeek models sometimes write their native DSML tool-call blocks (`<｜DSML｜invoke name="...">`) as text instead; complete blocks are converted the same way, and an incomplete one fails the turn with a diagnostic instead of ending it silently.
 7. Successful continuation turns reuse an OpenCode session and send only the new transcript. Changes to the model, prompt, tools or transcript prefix start a fresh session.
 
+A turn containing only reasoning, with no answer or usable Pi tool call, also gets one fresh recovery attempt instead of silently ending the conversation. The model is asked to answer or request an available Pi tool; normal text answers and valid calls found in reasoning are unchanged. Reasoning-only and blocked-native failures share the same single retry and remaining turn timeout. If recovery fails, Pi receives an explicit error, not another thinking-only message.
+
 Pi's provider instrumentation hooks follow the CLI transport, not OpenCode's internal HTTP traffic:
 
 - `onPayload` receives `{ prompt }`, the exact text written to the CLI's standard input. Returning `{ prompt: "..." }` replaces it; any other non-`undefined` value fails the turn. A turn with a payload hook always starts a fresh OpenCode session.
@@ -130,7 +132,7 @@ Pi's provider instrumentation hooks follow the CLI transport, not OpenCode's int
 - `onProviderStreamEvent` receives each validated `--format json` event in order, and is awaited before the event is processed.
 - Provider-scoped `env` values are passed to the subprocess. The bridge's own configuration directory and update-check settings always take precedence.
 
-Reasoning variants, image support and token limits follow CLI discovery. Token usage is taken from CLI events when available, otherwise estimated, and includes both attempts when native-tool recovery is needed. Session records and temporary project directories are cleaned up on a best-effort basis.
+Reasoning variants, image support and token limits follow CLI discovery. Token usage is taken from CLI events when available, otherwise estimated, and includes both attempts when recovery is needed. Session records and temporary project directories are cleaned up on a best-effort basis.
 
 ## Security, privacy and limits
 
