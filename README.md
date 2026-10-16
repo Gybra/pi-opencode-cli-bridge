@@ -33,12 +33,16 @@ The original MIT copyright notice is preserved in [LICENSE](LICENSE). The new pa
 
 - Node.js **22.19.0 or newer**.
 - Pi Coding Agent **1.2.0 or newer**; the development SDK is pinned to 1.2.0.
-- OpenCode installed on the same machine and available on `PATH`, or selected with `OPENCODE_PI_BIN`. Tested with OpenCode 1.19.0; other versions, including 2.x, are unverified.
+- OpenCode installed on the same machine and available on `PATH`, or selected with `OPENCODE_PI_BIN`. Tested with OpenCode **1.19.0** and **2.0.30**; other releases are unverified.
 
 Check OpenCode before starting Pi:
 
 ```sh
 opencode --version
+opencode models
+# Metadata on OpenCode 2.x:
+opencode api --standalone get /api/model
+# Metadata on OpenCode 1.x:
 opencode models opencode --verbose
 ```
 
@@ -107,15 +111,15 @@ The `test` command prints diagnostic commands; it does not send a model request 
 
 An explicit model list skips startup discovery and starts with conservative fallback capabilities. Run `/opencode-pi update` to discover image input, reasoning variants, token limits and costs.
 
-Without an override, discovery selects active models whose reported input and output costs are zero. When cost metadata is missing, selection falls back to the upstream free-model naming rules. Review costs before explicitly selecting a paid model.
+Without an override, discovery selects active `opencode/` models whose reported input and output costs are zero. OpenCode 2.x discovery uses the local `/api/model` endpoint, excludes disabled models, and checks every pricing tier before selecting a free model. For explicitly configured tiered models, displayed costs conservatively use the highest reported rate for each cost field. When cost metadata is missing, selection falls back to the upstream free-model naming rules. Review costs before explicitly selecting a paid model.
 
 ## How it works
 
 1. The extension discovers models through the local CLI.
 2. It replays Pi's transcript system messages to recover the current system prompt and tool declarations, including later changes.
-3. It creates a temporary OpenCode project containing a `pi-model` agent and a `tool.execute.before` plugin. Native tool declarations remain on the request. Execution is stopped twice: the plugin throws before any native tool runs, and the agent sets every permission to `ask`, which non-interactive `opencode run` rejects automatically. The second layer still holds if the plugin is missing or fails to load.
-4. It sends the prompt over standard input to `opencode run --format json`. User and tool-result images are written to temporary files and attached only when the model supports images.
-5. If the model calls a native OpenCode tool anyway, the call is still blocked. When every native call in that step has a Pi equivalent in the current tool list (`bash`, `read`, `write`, `edit` with a single replacement, `grep`, and `glob` as `find`), the bridge stops OpenCode and returns them as Pi tool calls. Paths inside the temporary project become relative to Pi's working directory. Otherwise OpenCode continues: the model sees a correction asking it to use a Pi tool, and the turn fails only if it does not recover.
+3. It creates a temporary OpenCode project containing a `pi-model` agent whose permissions are all `ask`. Non-interactive `opencode run` rejects those permission requests automatically, while native tool declarations remain on the model request. On 1.x, a generated `tool.execute.before` plugin provides a second guard; 2.x relies on the permission guard, not the legacy plugin.
+4. It sends the prompt over standard input to `opencode run --format json`. On 2.x, it uses a private `--standalone` server, sets the subprocess working directory instead of the removed `--dir` flag, and selects reasoning variants with `provider/model#variant` instead of `--variant`. User and tool-result images are written to temporary files and attached only when the model supports images.
+5. If the model calls a native OpenCode tool anyway, the call is still blocked. When every native call in that step has a Pi equivalent in the current tool list (`bash` or 2.x `shell`, `read`, `write`, `edit` with a single replacement, `grep`, and `glob` as `find`), the bridge stops OpenCode and returns them as Pi tool calls. Paths inside the temporary project become relative to Pi's working directory. Otherwise OpenCode continues: the model sees a correction asking it to use a Pi tool, and the turn fails only if it does not recover.
 6. Text markers such as `<pi_tool_call>{"name":"read","arguments":{"path":"example.txt"}}</pi_tool_call>` become Pi tool calls. Tool names must be in the current Pi tool list; execution then follows Pi's normal validation and permission pipeline. DeepSeek models sometimes write their native DSML tool-call blocks (`<｜DSML｜invoke name="...">`) as text instead; complete blocks are converted the same way, and an incomplete one fails the turn with a diagnostic instead of ending it silently.
 7. Successful continuation turns reuse an OpenCode session and send only the new transcript. Changes to the model, prompt, tools or transcript prefix start a fresh session.
 
@@ -132,11 +136,11 @@ Reasoning variants, image support and token limits follow CLI discovery. Token u
 
 - Prompts, system instructions, tool declarations, conversation text and attached images pass to OpenCode and its model provider. Do not send confidential data unless that provider's policies are suitable.
 - The extension does not directly extract credentials or call model HTTP endpoints. The OpenCode subprocess still runs as your user and can use its own configuration, credentials and inherited environment.
-- The native-tool guard is a guard rail, **not a sandbox**. An integration test runs the real OpenCode 1.19.0 CLI against a local model fixture that requests native `write` and `bash` calls, and checks that neither runs with the plugin intact, missing, or failing at startup. Other OpenCode versions, tools contributed by your own global OpenCode configuration (for example MCP servers), and a hostile local process are not covered.
+- The native-tool guard is a guard rail, **not a sandbox**. Integration tests run the real OpenCode 1.19.0 and 2.0.30 CLIs against a local model fixture that requests native `write` and `bash`/`shell` calls, and check that neither runs with the legacy plugin intact, missing, or failing at startup. Other OpenCode versions, tools contributed by your own global OpenCode configuration (for example MCP servers), and a hostile local process are not covered.
 - Pi and OpenCode can both retain local conversation data. Best-effort cleanup is not a guarantee of secure deletion.
 - Free-tier model availability and accepted request shapes can change. This fork makes no guarantee of continued access or compliance with a hosted provider's terms; review the applicable terms yourself.
 - Live tests with DeepSeek v4.1 Flash Free used thinking off. The first high-thinking test timed out; no default thinking setting is changed by this package.
-- At startup Pi warns if your OpenCode version is not 1.19.0, the version the native-tool guard was verified with.
+- At startup Pi warns if your OpenCode version is neither 1.19.0 nor 2.0.30, the exact releases covered by the native-tool guard tests.
 - Timeouts and cancellation escalate from `SIGTERM` to `SIGKILL` on the CLI's process group after 250 ms; on Windows the whole process tree is ended with `taskkill /T /F` (not tested on Windows). If OpenCode quits before reading the prompt, the turn shows OpenCode's own error rather than a broken-pipe error. Malformed or unexpected CLI events end the turn with an error instead of crashing Pi. Shutdown waits for session cleanup.
 
 See [SECURITY.md](SECURITY.md) for the trust boundaries and [docs/code-review.md](https://github.com/Gybra/pi-opencode-cli-bridge/blob/main/docs/code-review.md) for what was fixed and what remains. This is an experimental, unaudited fork.
@@ -151,7 +155,7 @@ OPENCODE_PI_INTEGRATION_BIN="$(which opencode)" npm run test:integration
 npm pack --dry-run
 ```
 
-`npm test` uses a fake OpenCode executable. `npm run test:integration` needs the real OpenCode CLI at exactly version 1.19.0 (on `PATH` or in `OPENCODE_PI_INTEGRATION_BIN`), runs it with isolated home and data directories against a local model fixture, and makes no network request. Neither suite needs API credentials. Development SDKs are pinned; Pi supplies those packages at runtime. The npm archive includes the extension source, README, security policy and license, not tests or installed dependencies.
+`npm test` uses a fake OpenCode executable. `npm run test:integration` needs the real OpenCode CLI at version 1.19.0 or 2.0.30 (on `PATH` or in `OPENCODE_PI_INTEGRATION_BIN`), runs it with isolated home and data directories against a local model fixture, and makes no network request. Neither suite needs API credentials. Development SDKs are pinned; Pi supplies those packages at runtime. The npm archive includes the extension source, README, security policy and license, not tests or installed dependencies.
 
 ## License
 
