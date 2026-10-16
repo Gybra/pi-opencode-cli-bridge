@@ -32,6 +32,7 @@ import type {
   Context,
   Message,
   Model,
+  SimpleStreamOptions,
   Tool,
   ToolCall,
 } from "@earendil-works/pi-ai";
@@ -87,10 +88,11 @@ function fakeEventScript(events: unknown[]): string {
 async function collectStreamEvents(
   script: string,
   context: Context,
+  options?: SimpleStreamOptions,
 ): Promise<AssistantMessageEvent[]> {
   return withFakeOpenCode(script, async () => {
     const events: AssistantMessageEvent[] = [];
-    for await (const event of streamOpenCode(fakeModel(), context)) {
+    for await (const event of streamOpenCode(fakeModel(), context, options)) {
       events.push(event);
     }
     return events;
@@ -273,16 +275,16 @@ test("parseVerboseModels maps an OpenCode off variant to Pi off", () => {
   });
 });
 
-test("reasoningCliArgs respects off, selected levels, and provider defaults", () => {
+test("reasoningCliArgs always captures reasoning without changing off or default effort", () => {
   const map = { off: "none", low: "low" } as const;
 
-  assert.deepEqual(reasoningCliArgs("off", map), []);
+  assert.deepEqual(reasoningCliArgs("off", map), ["--thinking"]);
   assert.deepEqual(reasoningCliArgs("low", map), [
     "--thinking",
     "--variant",
     "low",
   ]);
-  assert.deepEqual(reasoningCliArgs(undefined, map), []);
+  assert.deepEqual(reasoningCliArgs(undefined, map), ["--thinking"]);
   assert.deepEqual(reasoningCliArgs("high", map), ["--thinking"]);
 });
 
@@ -656,6 +658,7 @@ test("streamOpenCode accepts repaired tool JSON alongside thinking output", asyn
       { type: "text", part: { text: marker } },
     ]),
     fakeContext(["bash"]),
+    { reasoning: "high" },
   );
 
   assert.deepEqual(
@@ -1426,6 +1429,58 @@ for (const version of ["1.19.0", "2.0.30"]) {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+}
+
+for (const version of ["1.19.0", "2.0.30"]) {
+  for (const reasoning of [undefined, "off", "high"] as const) {
+    for (const reply of ["answer", "text call", "reasoning call"] as const) {
+      test(`OpenCode ${version} separates reasoning capture and display (${reasoning ?? "default"}, ${reply})`, async () => {
+        const dir = mkdtempSync(join(tmpdir(), "pi-thinking-display-"));
+        const capture = join(dir, "calls.jsonl");
+        const marker = '<pi_tool_call>{"name":"read","arguments":{"path":"fixture.txt"}}</pi_tool_call>';
+        const thinking = reply === "reasoning call" ? `Inspect the file. ${marker}` : "Private reasoning.";
+        const events: AssistantMessageEvent[] = [];
+        const observed: string[] = [];
+        try {
+          await withFakeOpenCode(recoveryScript(capture, [], [
+            { type: "reasoning", part: { text: thinking } },
+            { type: "text", part: { text: reply === "answer" ? "done" : reply === "text call" ? marker : "" } },
+          ]), async () => {
+            const stream = streamOpenCode({ ...fakeModel(), thinkingLevelMap: { off: "none", high: "max" } }, fakeContext(["read"]), {
+              // Pi maps off to undefined; also cover explicit off from JS callers.
+              reasoning: reasoning as SimpleStreamOptions["reasoning"],
+              onProviderStreamEvent: event => { observed.push((event as { type: string }).type); },
+            });
+            for await (const event of stream) events.push(event);
+            const message = await stream.result();
+            assert.equal(message.stopReason, reply === "answer" ? "stop" : "toolUse", message.errorMessage);
+            assert.equal(message.content.some(c => c.type === "thinking"), reasoning === "high");
+            assert.equal(events.some(e => e.type.startsWith("thinking_")), reasoning === "high");
+            assert.ok(observed.includes("reasoning"));
+            const content = message.content.filter(c => c.type !== "thinking");
+            if (reply === "answer") assert.deepEqual(content, [{ type: "text", text: "done" }]);
+            else {
+              assert.equal(content.length, 1);
+              assert.equal(content[0]?.type, "toolCall");
+              if (content[0]?.type === "toolCall") {
+                assert.equal(content[0].name, "read");
+                assert.deepEqual(content[0].arguments, { path: "fixture.txt" });
+              }
+            }
+            const calls = readInvocations(capture);
+            assert.equal(calls.length, 1);
+            const args = calls[0]!.args;
+            assert.equal(args.filter(arg => arg === "--thinking").length, 1);
+            assert.equal(args[args.indexOf("-m") + 1], reasoning === "high" && version === "2.0.30" ? "opencode/fake-free#max" : "opencode/fake-free");
+            assert.equal(args.includes("--variant"), reasoning === "high" && version === "1.19.0");
+            if (args.includes("--variant")) assert.equal(args[args.indexOf("--variant") + 1], "max");
+          }, version);
+        } finally {
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
+    }
+  }
 }
 
 test("reasoning-only recovery can answer without Pi tools", async () => {

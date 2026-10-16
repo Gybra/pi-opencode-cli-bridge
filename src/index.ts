@@ -264,9 +264,9 @@ export function reasoningCliArgs(
   requestedReasoning: ModelThinkingLevel | undefined,
   map?: ThinkingLevelMap,
 ): string[] {
-  if (!requestedReasoning || requestedReasoning === "off") return [];
-
+  // Capture blocks for recovery; --thinking controls CLI output, not model effort.
   const args = ["--thinking"];
+  if (!requestedReasoning || requestedReasoning === "off") return args;
   const variant = map?.[requestedReasoning];
   if (typeof variant === "string" && variant.trim()) {
     args.push("--variant", variant);
@@ -1869,7 +1869,7 @@ function streamOpenCodeAttempt(
         deleteOpenCodeSession(capturedSessionId);
       }
 
-      if (accumulatedThinking) {
+      if (accumulatedThinking && requestedReasoning && requestedReasoning !== "off") {
         const thinkingIndex = output.content.length;
         output.content.push({ type: "thinking", thinking: accumulatedThinking });
         stream.push({
