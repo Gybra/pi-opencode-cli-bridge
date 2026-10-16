@@ -20,7 +20,7 @@ const isV2 = version?.startsWith("2.") === true;
 const shellTool = isV2 ? "shell" : "bash";
 
 type Recorded = { tools: string[]; toolResults: string[]; messages: string };
-type Scenario = "side-effects" | "grep-recovery" | "reasoning-recovery";
+type Scenario = "side-effects" | "grep-recovery" | "reasoning-recovery" | "mixed-dsml" | "invalid-json";
 
 /** OpenAI-compatible SSE fixture for blocked native calls and Pi-tool recovery. */
 async function startFixture(scenario: Scenario) {
@@ -46,7 +46,15 @@ async function startFixture(scenario: Scenario) {
     const base = { id: "chatcmpl-fixture", object: "chat.completion.chunk", created: 1, model: "model" };
     const send = (choices: unknown[]) => res.write(`data: ${JSON.stringify({ ...base, choices })}\n\n`);
     res.writeHead(200, { "content-type": "text/event-stream" });
-    if (scenario === "reasoning-recovery" && tools.includes("write")) {
+    if ((scenario === "mixed-dsml" || scenario === "invalid-json") && tools.includes("write")) {
+      const content = messages.includes("Your previous attempt returned a malformed Pi tool call")
+        ? '<pi_tool_call>{"name":"bash","arguments":{"command":"rg needle ."}}</pi_tool_call>'
+        : scenario === "mixed-dsml"
+          ? '<pi_tool_call>{"name":"read","arguments":{"path":"fixture.txt"}}</｜｜DSML｜｜ parameter>\n</｜｜DSML｜｜ invoke>'
+          : '<pi_tool_call>{"name":"bash","arguments":{"command":"grep REPORT_TOKEN fixture.html}}</pi_tool_call>';
+      send([{ index: 0, delta: { role: "assistant", content }, finish_reason: null }]);
+      send([{ index: 0, delta: {}, finish_reason: "stop" }]);
+    } else if (scenario === "reasoning-recovery" && tools.includes("write")) {
       const delta = messages.includes("Your previous attempt ended with reasoning only")
         ? { role: "assistant", content: '<pi_tool_call>{"name":"bash","arguments":{"command":"curl -I https://example.com"}}</pi_tool_call>' }
         : { role: "assistant", reasoning_content: "I should use Pi bash to fetch the page. Let me do that." };
@@ -215,6 +223,21 @@ test("reasoning-only output recovers as a Pi tool call instead of silently endin
   assert.equal(requests.filter(request => request.tools.includes("write")).length, 2);
   assert.ok(requests.some(request => request.messages.includes("Your previous attempt ended with reasoning only")));
 });
+
+for (const scenario of ["mixed-dsml", "invalid-json"] as const) {
+  test(`malformed ${scenario} output is regenerated without executing the rejected call`, { timeout: 90_000 }, async () => {
+    const tools = piTools.filter(tool => tool.name === "bash");
+    const { message, requests } = await runNativeScenario("intact", tools, scenario);
+    assert.equal(message.stopReason, "toolUse", message.errorMessage);
+    const calls = message.content.filter(c => c.type === "toolCall");
+    assert.equal(calls.length, 1);
+    for (const call of calls) validateToolCall(tools, call);
+    assert.equal(calls[0]!.name, "bash");
+    assert.deepEqual(calls[0]!.arguments, { command: "rg needle ." });
+    assert.equal(requests.filter(request => request.tools.includes("write")).length, 2);
+    assert.ok(requests.some(request => request.messages.includes("Your previous attempt returned a malformed Pi tool call")));
+  });
+}
 
 test("without Pi equivalents the model gets the blocker's correction and the run continues", { timeout: 90_000 }, async () => {
   const { message, requests } = await runNativeScenario("intact", []);
