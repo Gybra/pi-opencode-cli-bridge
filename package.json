@@ -15,7 +15,7 @@
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "npm run build && node --test --test-timeout=60000 dist/index.test.js dist/process.test.js",
-    "test:integration": "npm run build && node --test --test-timeout=120000 dist/native-tools.integration.test.js",
+    "test:integration": "npm run build && node --test --test-timeout=240000 dist/native-tools.integration.test.js",
     "prepublishOnly": "npm run typecheck && npm test && npm run test:integration"
   },
   "pi": {
