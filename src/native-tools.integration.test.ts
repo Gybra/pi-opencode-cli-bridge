@@ -19,10 +19,11 @@ const version = /\d+\.\d+\.\d+/.exec(execFileSync(realBin, ["--version"], { enco
 const isV2 = version?.startsWith("2.") === true;
 const shellTool = isV2 ? "shell" : "bash";
 
-type Recorded = { tools: string[]; toolResults: string[] };
+type Recorded = { tools: string[]; toolResults: string[]; messages: string };
+type Scenario = "side-effects" | "grep-recovery";
 
-/** OpenAI-compatible SSE fixture: ask for native tools once, then answer with text. */
-async function startFixture() {
+/** OpenAI-compatible SSE fixture for blocked native calls and Pi-tool recovery. */
+async function startFixture(scenario: Scenario) {
   const requests: Recorded[] = [];
   const server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     let body = "";
@@ -39,12 +40,25 @@ async function startFixture() {
     const toolResults = (request.messages ?? [])
       .filter((message) => message.role === "tool")
       .map((message) => typeof message.content === "string" ? message.content : JSON.stringify(message.content));
-    requests.push({ tools, toolResults });
+    const messages = JSON.stringify(request.messages ?? []);
+    requests.push({ tools, toolResults, messages });
 
     const base = { id: "chatcmpl-fixture", object: "chat.completion.chunk", created: 1, model: "model" };
     const send = (choices: unknown[]) => res.write(`data: ${JSON.stringify({ ...base, choices })}\n\n`);
     res.writeHead(200, { "content-type": "text/event-stream" });
-    if (tools.includes("write") && toolResults.length === 0) {
+    if (scenario === "grep-recovery" && tools.includes("grep")) {
+      if (messages.includes("Your previous attempt used the disabled OpenCode native tool")) {
+        send([{ index: 0, delta: { role: "assistant", content: '<pi_tool_call>{"name":"bash","arguments":{"command":"rg needle ."}}</pi_tool_call>' }, finish_reason: null }]);
+        send([{ index: 0, delta: {}, finish_reason: "stop" }]);
+      } else if (toolResults.length === 0) {
+        send([{ index: 0, delta: { role: "assistant", tool_calls: [
+          { index: 0, id: "call_grep", type: "function", function: { name: "grep", arguments: JSON.stringify({ pattern: "needle" }) } },
+        ] }, finish_reason: null }]);
+        send([{ index: 0, delta: {}, finish_reason: "tool_calls" }]);
+      } else {
+        send([{ index: 0, delta: { role: "assistant", content: "" }, finish_reason: "stop" }]);
+      }
+    } else if (tools.includes("write") && toolResults.length === 0) {
       send([{ index: 0, delta: { role: "assistant", tool_calls: [
         { index: 0, id: "call_write", type: "function", function: { name: "write", arguments: JSON.stringify({ [isV2 ? "path" : "filePath"]: "write-sentinel.txt", content: "native write ran" }) } },
         { index: 1, id: "call_bash", type: "function", function: { name: shellTool, arguments: JSON.stringify({ command: "echo native bash ran > bash-sentinel.txt", description: "Write sentinel" }) } },
@@ -121,9 +135,9 @@ const piTools = [createWriteToolDefinition, createBashToolDefinition]
   .map((create) => create(process.cwd()))
   .map(({ name, description, parameters }) => ({ name, description, parameters })) as unknown as Tool[];
 
-async function runNativeScenario(mode: "intact" | "missing" | "failing", tools: Tool[]) {
+async function runNativeScenario(mode: "intact" | "missing" | "failing", tools: Tool[], scenario: Scenario = "side-effects") {
   const dir = mkdtempSync(join(tmpdir(), `pi-native-${mode}-`));
-  const fixture = await startFixture();
+  const fixture = await startFixture(scenario);
   const previousBin = process.env.OPENCODE_PI_BIN;
   const sessionId = `pi-native-${mode}-${Date.now()}`;
   process.env.OPENCODE_PI_BIN = writeWrapper(dir, mode);
@@ -163,6 +177,20 @@ for (const mode of ["intact", "missing", "failing"] as const) {
     );
   });
 }
+
+test("native grep stays blocked and recovers through Pi bash when Pi grep is unavailable", { timeout: 90_000 }, async () => {
+  const tools = piTools.filter(tool => tool.name === "bash");
+  const { message, requests } = await runNativeScenario("intact", tools, "grep-recovery");
+  assert.equal(message.stopReason, "toolUse", message.errorMessage);
+  const calls = message.content.filter(c => c.type === "toolCall");
+  assert.equal(calls.length, 1);
+  for (const call of calls) validateToolCall(tools, call);
+  assert.equal(calls[0]!.name, "bash");
+  assert.deepEqual(calls[0]!.arguments, { command: "rg needle ." });
+  assert.ok(requests.some(request => request.messages.includes("Available Pi tools: bash")));
+  const blocked = requests.flatMap(request => request.toolResults).join("\n");
+  assert.match(blocked, /disabled in the Pi bridge|cannot ask the user for permission|rejected|denied/i);
+});
 
 test("without Pi equivalents the model gets the blocker's correction and the run continues", { timeout: 90_000 }, async () => {
   const { message, requests } = await runNativeScenario("intact", []);

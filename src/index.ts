@@ -29,8 +29,7 @@ import {
 const PROVIDER_ID = "opencode-cli";
 const API_ID = "opencode-cli-runner";
 const AGENT_ID = "pi-model";
-// Only exact releases exercised by the real-CLI native-side-effect tests belong here.
-const VERIFIED_OPENCODE_VERSIONS = ["1.19.0", "2.0.30"];
+const MAX_SUPPORTED_OPENCODE_VERSION = "2.0.30";
 const cliVersions = new Map<string, string | undefined>();
 
 async function usesV2Cli(): Promise<boolean> {
@@ -1512,7 +1511,17 @@ export function streamOpenCode(
   context: Context,
   options?: SimpleStreamOptions,
 ): AssistantMessageEventStream {
+  return streamOpenCodeAttempt(model, context, options, true);
+}
+
+function streamOpenCodeAttempt(
+  model: Model<Api>,
+  context: Context,
+  options: SimpleStreamOptions | undefined,
+  allowNativeRecovery: boolean,
+): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
+  const deadline = Date.now() + resolveTurnTimeoutMs(options?.timeoutMs);
 
   (async () => {
     const output: AssistantMessage = {
@@ -1527,12 +1536,14 @@ export function streamOpenCode(
     };
 
     let tempDir: string | undefined;
+    let prompt = "";
     let accumulatedText = "";
     let accumulatedThinking = "";
     let stderr = "";
     let stdoutRemainder = "";
     let capturedSessionId: string | undefined;
     let opencodeToolUse: string | undefined;
+    let nativeToolFailure: Error | undefined;
     // Text after the last blocked native call shows whether the model recovered in-run.
     let nativeTextMark = 0;
     let stepNativeCalls: (ParsedToolCall | undefined)[] = [];
@@ -1578,7 +1589,7 @@ export function streamOpenCode(
         dropOpencodeSession(piState);
       }
       const isContinuation = delta !== undefined;
-      let prompt = isContinuation
+      prompt = isContinuation
         ? buildContinuationPrompt(delta)
         : buildPrompt(context);
       const sentMessages = isContinuation
@@ -1756,9 +1767,10 @@ export function streamOpenCode(
       }
       if (opencodeError) throw new Error(opencodeError);
       if (opencodeToolUse && !nativeCalls && !accumulatedText.slice(nativeTextMark).trim()) {
-        throw new Error(
-          `OpenCode attempted to use its disabled native tool (${JSON.stringify(opencodeToolUse)}). Retry the request; Pi tools must be requested with <pi_tool_call>{"name":"...","arguments":{}}</pi_tool_call> markers.`,
+        nativeToolFailure = new Error(
+          `OpenCode could not use the available Pi tools${allowNativeRecovery ? "" : " after one recovery attempt"} (blocked native tool: ${JSON.stringify(opencodeToolUse)}). Retry the request or select another OpenCode model.`,
         );
+        throw nativeToolFailure;
       }
 
       const toolCallResult = parseToolCallResponse(
@@ -1930,6 +1942,36 @@ export function streamOpenCode(
       // deleted best-effort and never fails the turn (#71, #75).
       deleteOpenCodeSession(capturedSessionId);
       if (piState) dropOpencodeSession(piState);
+      const remainingMs = deadline - Date.now();
+      if (nativeToolFailure && error === nativeToolFailure && allowNativeRecovery &&
+          !options?.signal?.aborted && remainingMs > 0 && context.tools?.length) {
+        setEstimatedUsage(model, output, prompt, accumulatedText + accumulatedThinking);
+        const correction = [
+          `Your previous attempt used the disabled OpenCode native tool ${JSON.stringify(opencodeToolUse)}.`,
+          `Available Pi tools: ${context.tools.map(tool => tool.name).join(", ")}.`,
+          "Complete the original request using only those Pi tools. Do not call any OpenCode native tool.",
+          'Request Pi tools as <pi_tool_call>{"name":"tool_name","arguments":{}}</pi_tool_call> markers, or answer normally if no tool is needed.',
+          "If Pi has no grep tool, request a search through Pi bash when it is available instead.",
+        ].join("\n");
+        // A fresh attempt keeps rejected native calls out of the continued transcript.
+        const recovery = streamOpenCodeAttempt(model, {
+          ...context,
+          messages: [...context.messages, { role: "user", content: correction, timestamp: Date.now() }],
+        }, { ...options, timeoutMs: remainingMs }, false);
+        for await (const event of recovery) {
+          if (event.type === "start") continue;
+          const message = event.type === "done" ? event.message : event.type === "error" ? event.error : undefined;
+          if (message) {
+            for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) {
+              message.usage[key] += output.usage[key];
+            }
+            calculateCost(model, message.usage);
+          }
+          stream.push(event);
+        }
+        stream.end();
+        return;
+      }
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage =
         error instanceof Error ? error.message : String(error);
@@ -2053,9 +2095,9 @@ export default async function opencodePiExtension(pi: ExtensionAPI) {
       "info",
     );
     const version = /\d+\.\d+\.\d+/.exec(cliStatus.summary)?.[0];
-    if (!version || !VERIFIED_OPENCODE_VERSIONS.includes(version)) {
+    if (!version || version.localeCompare(MAX_SUPPORTED_OPENCODE_VERSION, undefined, { numeric: true }) > 0) {
       ctx.ui.notify(
-        `opencode-pi: OpenCode ${version ?? cliStatus.summary} is not one of ${VERIFIED_OPENCODE_VERSIONS.join(", ")}, the versions the native-tool guard was verified with. Native OpenCode tools may not stay blocked.`,
+        `opencode-pi: detected OpenCode ${version ?? cliStatus.summary}. This bridge supports OpenCode up to ${MAX_SUPPORTED_OPENCODE_VERSION}. Please install a supported version.`,
         "warning",
       );
     }
