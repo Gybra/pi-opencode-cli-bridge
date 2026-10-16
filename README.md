@@ -33,7 +33,7 @@ The original MIT copyright notice is preserved in [LICENSE](LICENSE). The new pa
 
 - Node.js **22.19.0 or newer**.
 - Pi Coding Agent **1.2.0 or newer**; the development SDK is pinned to 1.2.0.
-- OpenCode installed on the same machine and available on `PATH`, or selected with `OPENCODE_PI_BIN`. Tested with OpenCode **1.19.0** and **2.0.30**; other releases are unverified.
+- OpenCode installed on the same machine and available on `PATH`, or selected with `OPENCODE_PI_BIN`. Supports OpenCode up to **2.0.30**. Real-CLI integration tests cover **1.19.0** and **2.0.30**; intermediate releases are not individually verified.
 
 Check OpenCode before starting Pi:
 
@@ -119,7 +119,7 @@ Without an override, discovery selects active `opencode/` models whose reported 
 2. It replays Pi's transcript system messages to recover the current system prompt and tool declarations, including later changes.
 3. It creates a temporary OpenCode project containing a `pi-model` agent whose permissions are all `ask`. Non-interactive `opencode run` rejects those permission requests automatically, while native tool declarations remain on the model request. On 1.x, a generated `tool.execute.before` plugin provides a second guard; 2.x relies on the permission guard, not the legacy plugin.
 4. It sends the prompt over standard input to `opencode run --format json`. On 2.x, it uses a private `--standalone` server, sets the subprocess working directory instead of the removed `--dir` flag, and selects reasoning variants with `provider/model#variant` instead of `--variant`. User and tool-result images are written to temporary files and attached only when the model supports images.
-5. If the model calls a native OpenCode tool anyway, the call is still blocked. When every native call in that step has a Pi equivalent in the current tool list (`bash` or 2.x `shell`, `read`, `write`, `edit` with a single replacement, `grep`, and `glob` as `find`), the bridge stops OpenCode and returns them as Pi tool calls. Paths inside the temporary project become relative to Pi's working directory. Otherwise OpenCode continues: the model sees a correction asking it to use a Pi tool, and the turn fails only if it does not recover.
+5. If the model calls a native OpenCode tool anyway, the call is still blocked. When every native call in that step has a Pi equivalent in the current tool list (`bash` or 2.x `shell`, `read`, `write`, `edit` with a single replacement, `grep`, and `glob` as `find`), the bridge stops OpenCode and returns them as Pi tool calls. Paths inside the temporary project become relative to Pi's working directory. Otherwise OpenCode continues and the model can correct itself. If it ends without recovering, the bridge makes one fresh attempt with the original transcript and a correction listing the available Pi tools. For example, when Pi has no `grep` tool, the model can request a search through Pi `bash` instead. Native tools stay blocked on both attempts, which share the turn timeout. A second failure produces an error rather than retrying indefinitely.
 6. Text markers such as `<pi_tool_call>{"name":"read","arguments":{"path":"example.txt"}}</pi_tool_call>` become Pi tool calls. Tool names must be in the current Pi tool list; execution then follows Pi's normal validation and permission pipeline. DeepSeek models sometimes write their native DSML tool-call blocks (`<｜DSML｜invoke name="...">`) as text instead; complete blocks are converted the same way, and an incomplete one fails the turn with a diagnostic instead of ending it silently.
 7. Successful continuation turns reuse an OpenCode session and send only the new transcript. Changes to the model, prompt, tools or transcript prefix start a fresh session.
 
@@ -130,7 +130,7 @@ Pi's provider instrumentation hooks follow the CLI transport, not OpenCode's int
 - `onProviderStreamEvent` receives each validated `--format json` event in order, and is awaited before the event is processed.
 - Provider-scoped `env` values are passed to the subprocess. The bridge's own configuration directory and update-check settings always take precedence.
 
-Reasoning variants, image support and token limits follow CLI discovery. Token usage is taken from CLI events when available, otherwise estimated. Session records and temporary project directories are cleaned up on a best-effort basis.
+Reasoning variants, image support and token limits follow CLI discovery. Token usage is taken from CLI events when available, otherwise estimated, and includes both attempts when native-tool recovery is needed. Session records and temporary project directories are cleaned up on a best-effort basis.
 
 ## Security, privacy and limits
 
@@ -140,7 +140,7 @@ Reasoning variants, image support and token limits follow CLI discovery. Token u
 - Pi and OpenCode can both retain local conversation data. Best-effort cleanup is not a guarantee of secure deletion.
 - Free-tier model availability and accepted request shapes can change. This fork makes no guarantee of continued access or compliance with a hosted provider's terms; review the applicable terms yourself.
 - Live tests with DeepSeek v4.1 Flash Free used thinking off. The first high-thinking test timed out; no default thinking setting is changed by this package.
-- At startup Pi warns if your OpenCode version is neither 1.19.0 nor 2.0.30, the exact releases covered by the native-tool guard tests.
+- At startup Pi warns when your OpenCode version exceeds the supported maximum, **2.0.30**, or its version cannot be determined.
 - Timeouts and cancellation escalate from `SIGTERM` to `SIGKILL` on the CLI's process group after 250 ms; on Windows the whole process tree is ended with `taskkill /T /F` (not tested on Windows). If OpenCode quits before reading the prompt, the turn shows OpenCode's own error rather than a broken-pipe error. Malformed or unexpected CLI events end the turn with an error instead of crashing Pi. Shutdown waits for session cleanup.
 
 See [SECURITY.md](SECURITY.md) for the trust boundaries and [docs/code-review.md](https://github.com/Gybra/pi-opencode-cli-bridge/blob/main/docs/code-review.md) for what was fixed and what remains. This is an experimental, unaudited fork.

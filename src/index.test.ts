@@ -875,7 +875,7 @@ test("streamOpenCode diagnoses an unclosed DSML tool call instead of ending the 
   assert.match(message.errorMessage ?? "", /incomplete DeepSeek DSML tool call.*<pi_tool_call>/);
 });
 
-test("streamOpenCode rejects native OpenCode tool use with marker remediation", async () => {
+test("streamOpenCode reports failed native-tool recovery without exposing protocol markers", async () => {
   const message = await withFakeOpenCode(
     fakeEventScript([{ type: "tool_use", part: { tool: "bash" } }]),
     () => streamOpenCode(fakeModel(), fakeContext(["read"])).result(),
@@ -884,8 +884,172 @@ test("streamOpenCode rejects native OpenCode tool use with marker remediation", 
   assert.equal(message.stopReason, "error");
   assert.equal(
     message.errorMessage,
-    'OpenCode attempted to use its disabled native tool ("bash"). Retry the request; Pi tools must be requested with <pi_tool_call>{"name":"...","arguments":{}}</pi_tool_call> markers.',
+    'OpenCode could not use the available Pi tools after one recovery attempt (blocked native tool: "bash"). Retry the request or select another OpenCode model.',
   );
+});
+
+function nativeRecoveryScript(capturePath: string, nextEvents: unknown[]): string {
+  return `
+const fs = require("node:fs");
+if (process.argv[2] !== "run") process.exit(0);
+let body = "";
+process.stdin.on("data", chunk => body += chunk);
+process.stdin.on("end", () => {
+  const capture = ${JSON.stringify(capturePath)};
+  const previous = fs.existsSync(capture) ? fs.readFileSync(capture, "utf8").trim().split("\\n").length : 0;
+  fs.appendFileSync(capture, JSON.stringify({ args: process.argv.slice(2), stdin: body }) + "\\n");
+  const events = previous === 0 ? [
+    { type: "text", part: { text: "discarded draft" } },
+    { type: "reasoning", part: { text: "discarded reasoning" } },
+    { type: "tool_use", part: { tool: "grep", state: { status: "error", input: { pattern: "needle", path: "." } } } },
+    { type: "step_finish", part: { tokens: { total: 10, input: 6, output: 4 } } },
+  ] : ${JSON.stringify(nextEvents)};
+  for (const event of events) process.stdout.write(JSON.stringify({ ...event, sessionID: "ses-native-" + previous }) + "\\n");
+});`;
+}
+
+const nativeRecoveryEvents = [
+  { type: "text", part: { text: '<pi_tool_call>{"name":"bash","arguments":{"command":"rg needle ."}}</pi_tool_call>' } },
+  { type: "step_finish", part: { tokens: { total: 5, input: 3, output: 2 } } },
+];
+
+for (const version of ["1.19.0", "2.0.30"]) {
+  test(`OpenCode ${version} recovers native grep through available Pi tools`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-native-recovery-"));
+    const capture = join(dir, "calls.jsonl");
+    const events: AssistantMessageEvent[] = [];
+    let payloads = 0;
+    try {
+      const message = await withFakeOpenCode(nativeRecoveryScript(capture, nativeRecoveryEvents), async () => {
+        const stream = streamOpenCode(fakeModel(), userContext(["Find needle in this project"], ["read", "bash", "edit", "write"]), {
+          onPayload: (payload) => {
+            payloads++;
+            return { prompt: (payload as { prompt: string }).prompt + "\nscoped payload" };
+          },
+        });
+        for await (const event of stream) events.push(event);
+        return stream.result();
+      }, version);
+      assert.equal(message.stopReason, "toolUse", message.errorMessage);
+      assert.deepEqual(message.content.map(c => c.type === "toolCall" ? { name: c.name, arguments: c.arguments } : c), [
+        { name: "bash", arguments: { command: "rg needle ." } },
+      ]);
+      assert.equal(events.filter(e => e.type === "start").length, 1);
+      assert.equal(events.filter(e => e.type === "error").length, 0);
+      assert.equal(events.filter(e => e.type === "done").length, 1);
+      assert.equal(message.usage.input, 9);
+      assert.equal(message.usage.output, 6);
+      assert.equal(message.usage.totalTokens, 15);
+      const calls = readInvocations(capture);
+      assert.equal(calls.length, 2);
+      assert.equal(payloads, 2);
+      assert.match(calls[1]!.stdin, /Find needle in this project/);
+      assert.match(calls[1]!.stdin, /native tool.*grep/i);
+      assert.match(calls[1]!.stdin, /needle/);
+      assert.match(calls[1]!.stdin, /Available Pi tools: read, bash, edit, write/);
+      assert.match(calls[1]!.stdin, /<pi_tool_call>/);
+      assert.match(calls[1]!.stdin, /scoped payload/);
+      assert.equal(calls[1]!.args.includes("--session"), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
+
+test("native-tool recovery stops after one attempt", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-native-repeat-"));
+  const capture = join(dir, "calls.jsonl");
+  try {
+    const message = await withFakeOpenCode(nativeRecoveryScript(capture, [
+      { type: "tool_use", part: { tool: "grep", state: { status: "error", input: { pattern: "needle" } } } },
+      { type: "step_finish", part: {} },
+    ]), () => streamOpenCode(fakeModel(), fakeContext(["bash"])).result(), "2.0.30");
+    assert.equal(message.stopReason, "error");
+    assert.match(message.errorMessage ?? "", /after one recovery attempt.*grep/);
+    assert.doesNotMatch(message.errorMessage ?? "", /<pi_tool_call>/);
+    assert.equal(readInvocations(capture).length, 2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("native-tool recovery is skipped when Pi exposes no tools", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-native-no-tools-"));
+  const capture = join(dir, "calls.jsonl");
+  try {
+    const message = await withFakeOpenCode(nativeRecoveryScript(capture, nativeRecoveryEvents), () =>
+      streamOpenCode(fakeModel(), fakeContext()).result());
+    assert.equal(message.stopReason, "error");
+    assert.doesNotMatch(message.errorMessage ?? "", /after one recovery attempt/);
+    assert.equal(readInvocations(capture).length, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("native-tool recovery does not retry after the turn budget expires", async t => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-native-deadline-"));
+  const capture = join(dir, "calls.jsonl");
+  const now = Date.now.bind(Date);
+  let elapsed = 0;
+  t.mock.method(Date, "now", () => now() + elapsed);
+  try {
+    const message = await withFakeOpenCode(nativeRecoveryScript(capture, nativeRecoveryEvents), () =>
+      streamOpenCode(fakeModel(), fakeContext(["bash"]), {
+        timeoutMs: 10_000,
+        onProviderStreamEvent: event => {
+          if ((event as { type: string }).type === "step_finish") elapsed = 100_000;
+        },
+      }).result());
+    assert.equal(message.stopReason, "error");
+    assert.doesNotMatch(message.errorMessage ?? "", /after one recovery attempt/);
+    assert.equal(readInvocations(capture).length, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("native-tool recovery does not retry after cancellation", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-native-abort-"));
+  const capture = join(dir, "calls.jsonl");
+  const controller = new AbortController();
+  try {
+    const message = await withFakeOpenCode(nativeRecoveryScript(capture, nativeRecoveryEvents), () =>
+      streamOpenCode(fakeModel(), fakeContext(["bash"]), {
+        signal: controller.signal,
+        onProviderStreamEvent: event => {
+          if ((event as { type: string }).type === "step_finish") controller.abort();
+        },
+      }).result());
+    assert.equal(message.stopReason, "aborted");
+    assert.equal(readInvocations(capture).length, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("native-tool recovery does not reuse hidden correction history on the next Pi turn", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-native-session-"));
+  const capture = join(dir, "calls.jsonl");
+  const sessionId = "pi-native-recovery-session";
+  try {
+    await withFakeOpenCode(nativeRecoveryScript(capture, nativeRecoveryEvents), async () => {
+      const first = await streamOpenCode(fakeModel(), userContext(["Find needle"], ["bash"]), { sessionId }).result();
+      assert.equal(first.stopReason, "toolUse", first.errorMessage);
+      const next = await streamOpenCode(fakeModel(), userContext(["Find needle", "Next question"], ["bash"]), { sessionId }).result();
+      assert.equal(next.stopReason, "toolUse", next.errorMessage);
+      const calls = readInvocations(capture);
+      assert.equal(calls.length, 3);
+      assert.equal(calls[2]!.args.includes("--session"), false);
+      assert.match(calls[2]!.stdin, /Find needle/);
+      assert.match(calls[2]!.stdin, /Next question/);
+      assert.doesNotMatch(calls[2]!.stdin, /Available Pi tools:/);
+      await cleanupPiSessionState(sessionId);
+    });
+  } finally {
+    await cleanupPiSessionState(sessionId);
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 const piToolDefinitions = [
@@ -971,26 +1135,28 @@ test("streamOpenCode accepts the model's recovery after an untranslatable native
     { type: "step_finish", part: {} },
   ]), () => streamOpenCode(fakeModel(), fakeContext(["read"])).result());
   assert.equal(unrecovered.stopReason, "error");
-  assert.match(unrecovered.errorMessage ?? "", /disabled native tool \("webfetch"\)/);
+  assert.match(unrecovered.errorMessage ?? "", /after one recovery attempt.*blocked native tool: "webfetch"/);
 });
 
-test("session_start warns when OpenCode is not the version the native-tool guard was verified with", async () => {
-  const previousModels = process.env.OPENCODE_PI_MODELS;
-  process.env.OPENCODE_PI_MODELS = "custom-model-a";
-  try {
-    const recorder = sessionStartRecorder();
-    const ctx = recordingCtx();
-    await withFakeOpenCode('process.stdout.write("opencode 9.9.9\\n");', async () => {
-      await opencodePiExtension(recorder.extension);
-      await recorder.run(ctx);
-    }, "opencode 9.9.9");
-    const warnings = ctx.notifications.filter((n) => n.level === "warning");
-    assert.equal(warnings.length, 1);
-    assert.match(warnings[0]!.message, /OpenCode 9\.9\.9.*1\.19\.0/);
-  } finally {
-    restoreEnv("OPENCODE_PI_MODELS", previousModels);
-  }
-});
+for (const version of ["2.0.31", "2.0.100", "2.1.0", "3.0.0"]) {
+  test(`session_start warns that OpenCode ${version} exceeds the supported maximum`, async () => {
+    const previousModels = process.env.OPENCODE_PI_MODELS;
+    process.env.OPENCODE_PI_MODELS = "custom-model-a";
+    try {
+      const recorder = sessionStartRecorder();
+      const ctx = recordingCtx();
+      await withFakeOpenCode("", async () => {
+        await opencodePiExtension(recorder.extension);
+        await recorder.run(ctx);
+      }, `opencode ${version}`);
+      const warnings = ctx.notifications.filter((n) => n.level === "warning");
+      assert.equal(warnings.length, 1);
+      assert.equal(warnings[0]!.message, `opencode-pi: detected OpenCode ${version}. This bridge supports OpenCode up to 2.0.30. Please install a supported version.`);
+    } finally {
+      restoreEnv("OPENCODE_PI_MODELS", previousModels);
+    }
+  });
+}
 
 test("streamOpenCode diagnoses empty provider output with detailed context", async () => {
   const message = await withFakeOpenCode("", () =>
@@ -2391,15 +2557,17 @@ test("OpenCode 2 shell calls translate to Pi bash without dropping unsupported e
   assert.equal(translate({ command: "npm test", timeout: 0 }), undefined);
 });
 
-test("session_start accepts the verified OpenCode 2 version", async () => {
-  const previous = process.env.OPENCODE_PI_MODELS;
-  process.env.OPENCODE_PI_MODELS = "big-pickle";
-  try {
-    const recorder = sessionStartRecorder(), ctx = recordingCtx();
-    await withFakeOpenCode("", async () => {
-      await opencodePiExtension(recorder.extension);
-      await recorder.run(ctx);
-    }, "opencode v2.0.30");
-    assert.deepEqual(ctx.notifications.filter(n => n.level === "warning"), []);
-  } finally { restoreEnv("OPENCODE_PI_MODELS", previous); }
-});
+for (const version of ["1.19.0", "2.0.9", "2.0.29", "2.0.30"]) {
+  test(`session_start accepts OpenCode ${version} up to the supported maximum`, async () => {
+    const previous = process.env.OPENCODE_PI_MODELS;
+    process.env.OPENCODE_PI_MODELS = "big-pickle";
+    try {
+      const recorder = sessionStartRecorder(), ctx = recordingCtx();
+      await withFakeOpenCode("", async () => {
+        await opencodePiExtension(recorder.extension);
+        await recorder.run(ctx);
+      }, `opencode v${version}`);
+      assert.deepEqual(ctx.notifications.filter(n => n.level === "warning"), []);
+    } finally { restoreEnv("OPENCODE_PI_MODELS", previous); }
+  });
+}
