@@ -33,7 +33,7 @@ The original MIT copyright notice is preserved in [LICENSE](LICENSE). The new pa
 
 - Node.js **22.19.0 or newer**.
 - Pi Coding Agent **1.2.0 or newer**; the development SDK is pinned to 1.2.0.
-- OpenCode installed on the same machine and available on `PATH`, or selected with `OPENCODE_PI_BIN`. Supports OpenCode up to **2.0.30**. Real-CLI integration tests cover **1.19.0** and **2.0.30**; intermediate releases are not individually verified.
+- OpenCode installed on the same machine and available on `PATH`, or selected with `OPENCODE_PI_BIN`. Supports OpenCode up to **2.0.31**. Real-CLI integration tests cover **1.19.0** and **2.0.31**; intermediate releases are not individually verified.
 
 Check OpenCode before starting Pi:
 
@@ -140,11 +140,11 @@ Reasoning variants, image support and token limits follow CLI discovery. Token u
 
 - Prompts, system instructions, tool declarations, conversation text and attached images pass to OpenCode and its model provider. Do not send confidential data unless that provider's policies are suitable.
 - The extension does not directly extract credentials or call model HTTP endpoints. The OpenCode subprocess still runs as your user and can use its own configuration, credentials and inherited environment.
-- The native-tool guard is a guard rail, **not a sandbox**. Integration tests run the real OpenCode 1.19.0 and 2.0.30 CLIs against a local model fixture that requests native `write` and `bash`/`shell` calls, and check that neither runs with the legacy plugin intact, missing, or failing at startup. Other OpenCode versions, tools contributed by your own global OpenCode configuration (for example MCP servers), and a hostile local process are not covered.
+- The native-tool guard is a guard rail, **not a sandbox**. Integration tests run the real OpenCode 1.19.0 and 2.0.31 CLIs against a local model fixture that requests native `write` and `bash`/`shell` calls, and check that neither runs with the legacy plugin intact, missing, or failing at startup. Other OpenCode versions, tools contributed by your own global OpenCode configuration (for example MCP servers), and a hostile local process are not covered.
 - Pi and OpenCode can both retain local conversation data. Best-effort cleanup is not a guarantee of secure deletion.
 - Free-tier model availability and accepted request shapes can change. This fork makes no guarantee of continued access or compliance with a hosted provider's terms; review the applicable terms yourself.
 - Live tests with DeepSeek v4.1 Flash Free used thinking off. The first high-thinking test timed out; no default thinking setting is changed by this package.
-- At startup Pi warns when your OpenCode version exceeds the supported maximum, **2.0.30**, or its version cannot be determined.
+- At startup Pi warns when your OpenCode version exceeds the supported maximum, **2.0.31**, or its version cannot be determined.
 - Timeouts and cancellation escalate from `SIGTERM` to `SIGKILL` on the CLI's process group after 250 ms; on Windows the whole process tree is ended with `taskkill /T /F` (not tested on Windows). If OpenCode quits before reading the prompt, the turn shows OpenCode's own error rather than a broken-pipe error. Malformed or unexpected CLI events end the turn with an error instead of crashing Pi. Shutdown waits for session cleanup.
 
 See [SECURITY.md](SECURITY.md) for the trust boundaries and [docs/code-review.md](https://github.com/Gybra/pi-opencode-cli-bridge/blob/main/docs/code-review.md) for what was fixed and what remains. This is an experimental, unaudited fork.
@@ -159,7 +159,7 @@ OPENCODE_PI_INTEGRATION_BIN="$(which opencode)" npm run test:integration
 npm pack --dry-run
 ```
 
-`npm test` uses a fake OpenCode executable. `npm run test:integration` needs the real OpenCode CLI at version 1.19.0 or 2.0.30 (on `PATH` or in `OPENCODE_PI_INTEGRATION_BIN`), runs it with isolated home and data directories against a local model fixture, and makes no network request. Neither suite needs API credentials. Development SDKs are pinned; Pi supplies those packages at runtime. The npm archive includes the extension source, README, security policy and license, not tests or installed dependencies.
+`npm test` uses a fake OpenCode executable. `npm run test:integration` needs the real OpenCode CLI at version 1.19.0 or 2.0.31 (on `PATH` or in `OPENCODE_PI_INTEGRATION_BIN`), runs it with isolated home and data directories against a local model fixture, and makes no network request. Neither suite needs API credentials. Development SDKs are pinned; Pi supplies those packages at runtime. The npm archive includes the extension source, README, security policy and license, not tests or installed dependencies.
 
 ## License
 
