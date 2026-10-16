@@ -11,7 +11,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { createBashToolDefinition, createWriteToolDefinition } from "@earendil-works/pi-coding-agent";
 import { validateToolCall } from "@earendil-works/pi-ai";
-import type { Api, Model, Tool } from "@earendil-works/pi-ai";
+import type { Api, Model, SimpleStreamOptions, Tool } from "@earendil-works/pi-ai";
 import { cleanupPiSessionState, streamOpenCode } from "./index.js";
 
 const realBin = process.env.OPENCODE_PI_INTEGRATION_BIN || "opencode";
@@ -20,7 +20,7 @@ const isV2 = version?.startsWith("2.") === true;
 const shellTool = isV2 ? "shell" : "bash";
 
 type Recorded = { tools: string[]; toolResults: string[]; messages: string };
-type Scenario = "side-effects" | "grep-recovery" | "reasoning-recovery" | "mixed-dsml" | "invalid-json";
+type Scenario = "side-effects" | "grep-recovery" | "reasoning-recovery" | "reasoning-answer" | "mixed-dsml" | "invalid-json";
 
 /** OpenAI-compatible SSE fixture for blocked native calls and Pi-tool recovery. */
 async function startFixture(scenario: Scenario) {
@@ -54,10 +54,12 @@ async function startFixture(scenario: Scenario) {
           : '<pi_tool_call>{"name":"bash","arguments":{"command":"grep REPORT_TOKEN fixture.html}}</pi_tool_call>';
       send([{ index: 0, delta: { role: "assistant", content }, finish_reason: null }]);
       send([{ index: 0, delta: {}, finish_reason: "stop" }]);
-    } else if (scenario === "reasoning-recovery" && tools.includes("write")) {
-      const delta = messages.includes("Your previous attempt ended with reasoning only")
-        ? { role: "assistant", content: '<pi_tool_call>{"name":"bash","arguments":{"command":"curl -I https://example.com"}}</pi_tool_call>' }
-        : { role: "assistant", reasoning_content: "I should use Pi bash to fetch the page. Let me do that." };
+    } else if ((scenario === "reasoning-recovery" || scenario === "reasoning-answer") && tools.includes("write")) {
+      const delta = scenario === "reasoning-answer"
+        ? { role: "assistant", reasoning_content: "Private reasoning from the fixture.", content: "done" }
+        : messages.includes("Your previous attempt ended with reasoning only")
+          ? { role: "assistant", content: '<pi_tool_call>{"name":"bash","arguments":{"command":"curl -I https://example.com"}}</pi_tool_call>' }
+          : { role: "assistant", reasoning_content: "I should use Pi bash to fetch the page. Let me do that." };
       send([{ index: 0, delta, finish_reason: null }]);
       send([{ index: 0, delta: {}, finish_reason: "stop" }]);
     } else if (scenario === "grep-recovery" && tools.includes("grep")) {
@@ -149,11 +151,12 @@ const piTools = [createWriteToolDefinition, createBashToolDefinition]
   .map((create) => create(process.cwd()))
   .map(({ name, description, parameters }) => ({ name, description, parameters })) as unknown as Tool[];
 
-async function runNativeScenario(mode: "intact" | "missing" | "failing", tools: Tool[], scenario: Scenario = "side-effects") {
+async function runNativeScenario(mode: "intact" | "missing" | "failing", tools: Tool[], scenario: Scenario = "side-effects", reasoning?: "off" | "high") {
   const dir = mkdtempSync(join(tmpdir(), `pi-native-${mode}-`));
   const fixture = await startFixture(scenario);
   const previousBin = process.env.OPENCODE_PI_BIN;
   const sessionId = `pi-native-${mode}-${Date.now()}`;
+  const observed: string[] = [];
   process.env.OPENCODE_PI_BIN = writeWrapper(dir, mode);
   try {
     const message = await streamOpenCode(fixtureModel(), {
@@ -162,7 +165,8 @@ async function runNativeScenario(mode: "intact" | "missing" | "failing", tools: 
     }, {
       sessionId,
       timeoutMs: 60_000,
-      reasoning: scenario === "reasoning-recovery" ? "high" : undefined,
+      reasoning: reasoning as SimpleStreamOptions["reasoning"],
+      onProviderStreamEvent: event => { observed.push((event as { type: string }).type); },
       env: isolatedEnv(join(dir, "home"), fixture.port),
     }).result();
     const project = readFileSync(join(dir, "project-dir"), "utf8");
@@ -172,7 +176,7 @@ async function runNativeScenario(mode: "intact" | "missing" | "failing", tools: 
     assert.ok(first.tools.includes(shellTool));
     assert.equal(existsSync(join(project, "write-sentinel.txt")), false, "native write executed");
     assert.equal(existsSync(join(project, "bash-sentinel.txt")), false, "native bash executed");
-    return { message, requests: fixture.requests };
+    return { message, requests: fixture.requests, observed };
   } finally {
     process.env.OPENCODE_PI_BIN = previousBin;
     if (previousBin === undefined) delete process.env.OPENCODE_PI_BIN;
@@ -211,17 +215,28 @@ test("native grep stays blocked and recovers through Pi bash when Pi grep is una
   assert.match(blocked, /disabled in the Pi bridge|cannot ask the user for permission|rejected|denied/i);
 });
 
-test("reasoning-only output recovers as a Pi tool call instead of silently ending the turn", { timeout: 90_000 }, async () => {
-  const tools = piTools.filter(tool => tool.name === "bash");
-  const { message, requests } = await runNativeScenario("intact", tools, "reasoning-recovery");
-  assert.equal(message.stopReason, "toolUse", message.errorMessage);
-  const calls = message.content.filter(c => c.type === "toolCall");
-  assert.equal(calls.length, 1);
-  for (const call of calls) validateToolCall(tools, call);
-  assert.deepEqual(calls[0]!.arguments, { command: "curl -I https://example.com" });
-  assert.equal(calls[0]!.name, "bash");
-  assert.equal(requests.filter(request => request.tools.includes("write")).length, 2);
-  assert.ok(requests.some(request => request.messages.includes("Your previous attempt ended with reasoning only")));
+for (const reasoning of [undefined, "off", "high"] as const) {
+  test(`reasoning-only output recovers with thinking ${reasoning ?? "default"}`, { timeout: 90_000 }, async () => {
+    const tools = piTools.filter(tool => tool.name === "bash");
+    const { message, requests, observed } = await runNativeScenario("intact", tools, "reasoning-recovery", reasoning);
+    assert.equal(message.stopReason, "toolUse", message.errorMessage);
+    const calls = message.content.filter(c => c.type === "toolCall");
+    assert.equal(calls.length, 1);
+    for (const call of calls) validateToolCall(tools, call);
+    assert.deepEqual(calls[0]!.arguments, { command: "curl -I https://example.com" });
+    assert.equal(calls[0]!.name, "bash");
+    assert.equal(requests.filter(request => request.tools.includes("write")).length, 2);
+    assert.ok(requests.some(request => request.messages.includes("Your previous attempt ended with reasoning only")));
+    assert.ok(observed.includes("reasoning"));
+  });
+}
+
+test("thinking off captures reasoning internally without displaying it", { timeout: 90_000 }, async () => {
+  const { message, requests, observed } = await runNativeScenario("intact", piTools, "reasoning-answer", "off");
+  assert.equal(message.stopReason, "stop", message.errorMessage);
+  assert.ok(observed.includes("reasoning"), "CLI reasoning was not captured");
+  assert.deepEqual(message.content, [{ type: "text", text: "done" }]);
+  assert.equal(requests.filter(request => request.tools.includes("write")).length, 1);
 });
 
 for (const scenario of ["mixed-dsml", "invalid-json"] as const) {
