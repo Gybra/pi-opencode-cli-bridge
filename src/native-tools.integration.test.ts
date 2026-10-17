@@ -1,5 +1,5 @@
 // Runs the real OpenCode CLI against a local OpenAI-compatible fixture that asks
-// for native side effects. Needs OpenCode 1.19.0 or 2.0.31: set OPENCODE_PI_INTEGRATION_BIN
+// for native side effects. Needs OpenCode 1.19.0 or 2.0.32: set OPENCODE_PI_INTEGRATION_BIN
 // or put `opencode` on PATH. No network access or credentials are used.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -161,7 +161,7 @@ function isolatedEnv(home: string, port: number): Record<string, string> {
 }
 
 test("real OpenCode CLI version matches the pinned integration target", () => {
-  assert.ok(version && ["1.19.0", "2.0.31"].includes(version), "set OPENCODE_PI_INTEGRATION_BIN to OpenCode 1.19.0 or 2.0.31");
+  assert.ok(version && ["1.19.0", "2.0.32"].includes(version), "set OPENCODE_PI_INTEGRATION_BIN to OpenCode 1.19.0 or 2.0.32");
 });
 
 // Pi's real tool schemas, so translated calls are checked against what Pi will validate.
