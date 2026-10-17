@@ -1,0 +1,125 @@
+name: Publish
+
+# Daily: follow new OpenCode releases (bump, test, release) and publish any
+# package version that is in main but not yet on npm. Manual runs do the same.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      bump: ${{ steps.plan.outputs.bump }}
+      publish: ${{ steps.plan.outputs.publish }}
+      opencode: ${{ steps.plan.outputs.opencode }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          max=$(sed -n 's/.*MAX_SUPPORTED_OPENCODE_VERSION = "\([0-9.]*\)".*/\1/p' src/index.ts)
+          latest=$(npm view @opencode/cli version)
+          package=$(node -p "require('./package.json').version")
+          published=$(npm view pi-opencode-cli-bridge version)
+          # The value ends up in shell commands below.
+          echo "$latest" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::unexpected OpenCode version: $latest"; exit 1; }
+          bump=false publish=false opencode=$max
+          newest=$(printf '%s\n%s\n' "$max" "$latest" | sort -V | tail -n1)
+          if [ "$latest" != "$max" ] && [ "$newest" = "$latest" ]; then
+            if [ "${latest%%.*}" = "${max%%.*}" ]; then
+              bump=true publish=true opencode=$latest
+            else
+              # A new major usually changes the CLI protocol: needs a human.
+              echo "::warning::OpenCode $latest is a new major (supported: $max); not releasing automatically"
+            fi
+          fi
+          # Also resume a run that published to npm but failed before creating the GitHub release.
+          if [ "$bump" = false ] && { [ "$package" != "$published" ] || ! gh release view "v$package" >/dev/null 2>&1; }; then publish=true; fi
+          echo "max=$max latest=$latest package=$package published=$published -> bump=$bump publish=$publish"
+          { echo "bump=$bump"; echo "publish=$publish"; echo "opencode=$opencode"; } >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: plan
+    if: needs.plan.outputs.publish == 'true'
+    name: test (${{ matrix.os }}, Node ${{ matrix.node }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ["22.19.0", "24"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+      - if: needs.plan.outputs.bump == 'true'
+        run: node scripts/bump-opencode-version.mjs "${{ needs.plan.outputs.opencode }}"
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - name: Install pinned OpenCode
+        run: npm install --prefix "$RUNNER_TEMP/opencode" --no-audit --no-fund opencode-ai@1.19.0
+      - run: npm run test:integration
+        env:
+          OPENCODE_PI_INTEGRATION_BIN: ${{ runner.temp }}/opencode/node_modules/.bin/opencode
+      - name: Install OpenCode 2
+        run: npm install --prefix "$RUNNER_TEMP/opencode-v2" --no-audit --no-fund "@opencode/cli@${{ needs.plan.outputs.opencode }}"
+      - name: Test OpenCode 2 native-tool guard
+        run: npm run test:integration
+        env:
+          OPENCODE_PI_INTEGRATION_BIN: ${{ runner.temp }}/opencode-v2/node_modules/.bin/opencode
+      - run: npm pack --dry-run
+
+  release:
+    needs: [plan, test]
+    runs-on: ubuntu-latest
+    # Holds the GitHub App key; restricted to main in the repo settings.
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing (OIDC)
+    steps:
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ steps.app.outputs.token }}
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or newer.
+      - run: npm install -g npm@latest
+      - if: needs.plan.outputs.bump == 'true'
+        run: node scripts/bump-opencode-version.mjs "${{ needs.plan.outputs.opencode }}"
+      # Push before publishing: if main moved meanwhile the push fails and npm gets nothing.
+      - if: needs.plan.outputs.bump == 'true'
+        run: |
+          version=$(node -p "require('./package.json').version")
+          git config user.name "pi-opencode-release[bot]"
+          git config user.email "pi-opencode-release[bot]@users.noreply.github.com"
+          git commit -am "chore: release $version with OpenCode ${{ needs.plan.outputs.opencode }} support"
+          git push origin HEAD:main
+      # Tests already ran above; prepublishOnly would need a real OpenCode binary.
+      - run: |
+          version=$(node -p "require('./package.json').version")
+          npm view "pi-opencode-cli-bridge@$version" version >/dev/null 2>&1 || npm publish --ignore-scripts
+      - run: |
+          version=$(node -p "require('./package.json').version")
+          gh release view "v$version" >/dev/null 2>&1 || gh release create "v$version" --target "$(git rev-parse HEAD)" --generate-notes
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
