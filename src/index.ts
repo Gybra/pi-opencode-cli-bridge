@@ -29,7 +29,7 @@ import {
 const PROVIDER_ID = "opencode-cli";
 const API_ID = "opencode-cli-runner";
 const AGENT_ID = "pi-model";
-const MAX_SUPPORTED_OPENCODE_VERSION = "2.0.31";
+const MAX_SUPPORTED_OPENCODE_VERSION = "2.0.32";
 const cliVersions = new Map<string, string | undefined>();
 
 async function usesV2Cli(): Promise<boolean> {
@@ -1546,8 +1546,6 @@ function streamOpenCodeAttempt(
     const nativeToolRequests: { name: string; arguments: unknown }[] = [];
     let recoverableFailure: Error | undefined;
     let toolCallFailure: Extract<ToolCallParseResult, { ok: false }> | undefined;
-    // Text after the last blocked native call shows whether the model recovered in-run.
-    let nativeTextMark = 0;
     let stepNativeCalls: (ParsedToolCall | undefined)[] = [];
     let nativeCalls: ParsedToolCall[] | undefined;
     // Thrown from the event handler so the process runner stops OpenCode.
@@ -1702,7 +1700,6 @@ function streamOpenCodeAttempt(
 
         if (event.type === "tool_use") {
           opencodeToolUse = part?.tool ? String(part.tool) : "unknown";
-          nativeTextMark = accumulatedText.length;
           const input = objectRecord(part?.state)?.input;
           nativeToolRequests.push({ name: opencodeToolUse, arguments: input });
           stepNativeCalls.push(translateNativeToolCall(
@@ -1770,13 +1767,6 @@ function streamOpenCodeAttempt(
         }
       }
       if (opencodeError) throw new Error(opencodeError);
-      if (opencodeToolUse && !nativeCalls && !accumulatedText.slice(nativeTextMark).trim()) {
-        recoverableFailure = new Error(
-          `OpenCode could not use the available Pi tools${allowRecovery ? "" : " after one recovery attempt"} (blocked native tool: ${JSON.stringify(opencodeToolUse)}). Retry the request or select another OpenCode model.`,
-        );
-        throw recoverableFailure;
-      }
-
       const toolCallResult = parseToolCallResponse(
         accumulatedText,
         allowedToolNames,
@@ -1809,6 +1799,15 @@ function streamOpenCodeAttempt(
           );
         }
         textCalls = reasoningResult.calls;
+      }
+      // A blocked native call recovers unless the model produced a usable Pi
+      // tool call: the text after the last native call was empty, or it was
+      // prose that parses to zero calls (e.g. "please run a curl instead").
+      if (opencodeToolUse && !nativeCalls && textCalls.length === 0) {
+        recoverableFailure = new Error(
+          `OpenCode could not use the available Pi tools${allowRecovery ? "" : " after one recovery attempt"} (blocked native tool: ${JSON.stringify(opencodeToolUse)}). Retry the request or select another OpenCode model.`,
+        );
+        throw recoverableFailure;
       }
       const toolCalls = [...textCalls, ...(nativeCalls ?? [])];
       if (toolCalls.length === 0 && displayText.trim()) {
