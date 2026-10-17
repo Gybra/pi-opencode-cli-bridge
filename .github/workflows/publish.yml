@@ -24,6 +24,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           max=$(sed -n 's/.*MAX_SUPPORTED_OPENCODE_VERSION = "\([0-9.]*\)".*/\1/p' src/index.ts)
           latest=$(npm view @opencode/cli version)
@@ -41,7 +43,8 @@ jobs:
               echo "::warning::OpenCode $latest is a new major (supported: $max); not releasing automatically"
             fi
           fi
-          if [ "$bump" = false ] && [ "$package" != "$published" ]; then publish=true; fi
+          # Also resume a run that published to npm but failed before creating the GitHub release.
+          if [ "$bump" = false ] && { [ "$package" != "$published" ] || ! gh release view "v$package" >/dev/null 2>&1; }; then publish=true; fi
           echo "max=$max latest=$latest package=$package published=$published -> bump=$bump publish=$publish"
           { echo "bump=$bump"; echo "publish=$publish"; echo "opencode=$opencode"; } >> "$GITHUB_OUTPUT"
 
@@ -112,7 +115,11 @@ jobs:
           git commit -am "chore: release $version with OpenCode ${{ needs.plan.outputs.opencode }} support"
           git push origin HEAD:main
       # Tests already ran above; prepublishOnly would need a real OpenCode binary.
-      - run: npm publish --ignore-scripts
-      - run: gh release create "v$(node -p "require('./package.json').version")" --target "$(git rev-parse HEAD)" --generate-notes
+      - run: |
+          version=$(node -p "require('./package.json').version")
+          npm view "pi-opencode-cli-bridge@$version" version >/dev/null 2>&1 || npm publish --ignore-scripts
+      - run: |
+          version=$(node -p "require('./package.json').version")
+          gh release view "v$version" >/dev/null 2>&1 || gh release create "v$version" --target "$(git rev-parse HEAD)" --generate-notes
         env:
           GH_TOKEN: ${{ steps.app.outputs.token }}
