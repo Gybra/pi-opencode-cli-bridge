@@ -1770,13 +1770,6 @@ function streamOpenCodeAttempt(
         }
       }
       if (opencodeError) throw new Error(opencodeError);
-      if (opencodeToolUse && !nativeCalls && !accumulatedText.slice(nativeTextMark).trim()) {
-        recoverableFailure = new Error(
-          `OpenCode could not use the available Pi tools${allowRecovery ? "" : " after one recovery attempt"} (blocked native tool: ${JSON.stringify(opencodeToolUse)}). Retry the request or select another OpenCode model.`,
-        );
-        throw recoverableFailure;
-      }
-
       const toolCallResult = parseToolCallResponse(
         accumulatedText,
         allowedToolNames,
@@ -1810,10 +1803,14 @@ function streamOpenCodeAttempt(
         }
         textCalls = reasoningResult.calls;
       }
-      // A blocked native call answered with only prose (zero usable Pi calls)
-      // recovers when Pi has tools to offer, e.g. "please run a curl instead".
-      // With no Pi tools, that prose is the model's explanation and stays final.
-      if (opencodeToolUse && !nativeCalls && textCalls.length === 0 && allowedToolNames.size > 0) {
+      // A blocked native call with no usable Pi call recovers: nothing after it
+      // to answer with, or prose while Pi exposes tools to try (e.g. "please run
+      // a curl"). A valid call in text or reasoning is used instead of retrying;
+      // with no Pi tools the prose is the model's explanation and stays final.
+      if (
+        opencodeToolUse && !nativeCalls && textCalls.length === 0 &&
+        (!accumulatedText.slice(nativeTextMark).trim() || allowedToolNames.size > 0)
+      ) {
         recoverableFailure = new Error(
           `OpenCode could not use the available Pi tools${allowRecovery ? "" : " after one recovery attempt"} (blocked native tool: ${JSON.stringify(opencodeToolUse)}). Retry the request or select another OpenCode model.`,
         );

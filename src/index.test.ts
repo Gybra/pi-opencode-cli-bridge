@@ -1202,6 +1202,25 @@ test("blocked native call does not retry when the model emits a valid Pi tool ca
   }
 });
 
+test("blocked native call keeps a valid Pi call found only in reasoning without retrying", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-native-reasoning-noretry-"));
+  const capture = join(dir, "calls.jsonl");
+  try {
+    const message = await withFakeOpenCode(recoveryScript(capture, [], [
+      { type: "tool_use", part: { tool: "webfetch", state: { status: "error", input: { url: "https://example.com" } } } },
+      { type: "reasoning", part: { text: '<pi_tool_call>{"name":"bash","arguments":{"command":"curl -s https://example.com"}}</pi_tool_call>' } },
+      { type: "step_finish", part: { tokens: { total: 10, input: 6, output: 4 } } },
+    ]), () => streamOpenCode(fakeModel(), fakeContext(["bash"])).result(), "2.0.30");
+    assert.equal(message.stopReason, "toolUse", message.errorMessage);
+    assert.deepEqual(message.content.map(c => c.type === "toolCall" ? { name: c.name, arguments: c.arguments } : c), [
+      { name: "bash", arguments: { command: "curl -s https://example.com" } },
+    ]);
+    assert.equal(readInvocations(capture).length, 1, "a valid Pi call in reasoning must not trigger a retry");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("malformed-call recovery does not retry unavailable Pi tools", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-unavailable-no-retry-"));
   const capture = join(dir, "calls.jsonl");
