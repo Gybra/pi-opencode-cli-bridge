@@ -1160,6 +1160,48 @@ test("native-tool recovery stops after one attempt", async () => {
   }
 });
 
+test("blocked native call recovers when the model replies with prose instead of a Pi call", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-native-prose-recovery-"));
+  const capture = join(dir, "calls.jsonl");
+  try {
+    const message = await withFakeOpenCode(recoveryScript(capture, nativeRecoveryEvents, [
+      { type: "tool_use", part: { tool: "webfetch", state: { status: "error", input: { url: "https://example.com" } } } },
+      { type: "text", part: { text: "Il fetch diretto è stato rifiutato dalle permission. Chiedo a Pi di eseguire un curl." } },
+      { type: "step_finish", part: { tokens: { total: 10, input: 6, output: 4 } } },
+    ]), () => streamOpenCode(fakeModel(), userContext(["Leggi la pagina web https://example.com e dimmi cosa contiene."], ["read", "bash"])).result(), "2.0.30");
+    assert.equal(message.stopReason, "toolUse", message.errorMessage);
+    assert.deepEqual(message.content.map(c => c.type === "toolCall" ? { name: c.name, arguments: c.arguments } : c), [
+      { name: "bash", arguments: { command: "rg needle ." } },
+    ]);
+    const invocations = readInvocations(capture);
+    assert.equal(invocations.length, 2, "prose-only recovery must retry once");
+    assert.match(invocations[1]!.stdin, /disabled OpenCode native tool "webfetch"/);
+    assert.match(invocations[1]!.stdin, /Available Pi tools: read, bash/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("blocked native call does not retry when the model emits a valid Pi tool call", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-native-valid-noretry-"));
+  const capture = join(dir, "calls.jsonl");
+  try {
+    const reply = 'Non posso usare webfetch.\n<pi_tool_call>{"name":"bash","arguments":{"command":"curl -s https://example.com"}}</pi_tool_call>';
+    const message = await withFakeOpenCode(recoveryScript(capture, nativeRecoveryEvents, [
+      { type: "tool_use", part: { tool: "webfetch", state: { status: "error", input: { url: "https://example.com" } } } },
+      { type: "text", part: { text: reply } },
+      { type: "step_finish", part: { tokens: { total: 10, input: 6, output: 4 } } },
+    ]), () => streamOpenCode(fakeModel(), fakeContext(["bash"])).result(), "2.0.30");
+    assert.equal(message.stopReason, "toolUse", message.errorMessage);
+    assert.deepEqual(message.content.map(c => c.type === "toolCall" ? { name: c.name, arguments: c.arguments } : c), [
+      { name: "bash", arguments: { command: "curl -s https://example.com" } },
+    ]);
+    assert.equal(readInvocations(capture).length, 1, "a valid Pi call must not trigger a retry");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("malformed-call recovery does not retry unavailable Pi tools", async () => {
   const dir = mkdtempSync(join(tmpdir(), "pi-unavailable-no-retry-"));
   const capture = join(dir, "calls.jsonl");
@@ -1341,7 +1383,7 @@ test("streamOpenCode accepts the model's recovery after an untranslatable native
   assert.match(unrecovered.errorMessage ?? "", /after one recovery attempt.*blocked native tool: "webfetch"/);
 });
 
-for (const version of ["2.0.32", "2.0.100", "2.1.0", "3.0.0"]) {
+for (const version of ["2.0.33", "2.0.100", "2.1.0", "3.0.0"]) {
   test(`session_start warns that OpenCode ${version} exceeds the supported maximum`, async () => {
     const previousModels = process.env.OPENCODE_PI_MODELS;
     process.env.OPENCODE_PI_MODELS = "custom-model-a";
@@ -1354,7 +1396,7 @@ for (const version of ["2.0.32", "2.0.100", "2.1.0", "3.0.0"]) {
       }, `opencode ${version}`);
       const warnings = ctx.notifications.filter((n) => n.level === "warning");
       assert.equal(warnings.length, 1);
-      assert.equal(warnings[0]!.message, `opencode-pi: detected OpenCode ${version}. This bridge supports OpenCode up to 2.0.31. Please install a supported version.`);
+      assert.equal(warnings[0]!.message, `opencode-pi: detected OpenCode ${version}. This bridge supports OpenCode up to 2.0.32. Please install a supported version.`);
     } finally {
       restoreEnv("OPENCODE_PI_MODELS", previousModels);
     }
@@ -2904,7 +2946,7 @@ test("OpenCode 2 shell calls translate to Pi bash without dropping unsupported e
   assert.equal(translate({ command: "npm test", timeout: 0 }), undefined);
 });
 
-for (const version of ["1.19.0", "2.0.9", "2.0.29", "2.0.30", "2.0.31"]) {
+for (const version of ["1.19.0", "2.0.9", "2.0.29", "2.0.30", "2.0.31", "2.0.32"]) {
   test(`session_start accepts OpenCode ${version} up to the supported maximum`, async () => {
     const previous = process.env.OPENCODE_PI_MODELS;
     process.env.OPENCODE_PI_MODELS = "big-pickle";

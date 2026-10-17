@@ -29,7 +29,7 @@ import {
 const PROVIDER_ID = "opencode-cli";
 const API_ID = "opencode-cli-runner";
 const AGENT_ID = "pi-model";
-const MAX_SUPPORTED_OPENCODE_VERSION = "2.0.31";
+const MAX_SUPPORTED_OPENCODE_VERSION = "2.0.32";
 const cliVersions = new Map<string, string | undefined>();
 
 async function usesV2Cli(): Promise<boolean> {
@@ -1809,6 +1809,15 @@ function streamOpenCodeAttempt(
           );
         }
         textCalls = reasoningResult.calls;
+      }
+      // A blocked native call answered with only prose (zero usable Pi calls)
+      // recovers when Pi has tools to offer, e.g. "please run a curl instead".
+      // With no Pi tools, that prose is the model's explanation and stays final.
+      if (opencodeToolUse && !nativeCalls && textCalls.length === 0 && allowedToolNames.size > 0) {
+        recoverableFailure = new Error(
+          `OpenCode could not use the available Pi tools${allowRecovery ? "" : " after one recovery attempt"} (blocked native tool: ${JSON.stringify(opencodeToolUse)}). Retry the request or select another OpenCode model.`,
+        );
+        throw recoverableFailure;
       }
       const toolCalls = [...textCalls, ...(nativeCalls ?? [])];
       if (toolCalls.length === 0 && displayText.trim()) {
