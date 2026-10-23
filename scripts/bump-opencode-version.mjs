@@ -29,7 +29,7 @@ function edit(file, replacements) {
 }
 
 const oldRe = new RegExp(`(?<![\\d.])${old.replaceAll(".", "\\.")}(?![\\d.]*\\d)`, "g");
-for (const file of ["src/index.ts", "src/native-tools.integration.test.ts", "README.md", "SECURITY.md", ".github/workflows/test.yml"]) {
+for (const file of ["src/index.ts", "src/native-tools.integration.test.ts", "README.md", "SECURITY.md"]) {
   edit(file, [[oldRe, next]]);
 }
 
