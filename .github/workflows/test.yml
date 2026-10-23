@@ -32,8 +32,12 @@ jobs:
       - run: npm run test:integration
         env:
           OPENCODE_PI_INTEGRATION_BIN: ${{ runner.temp }}/opencode/node_modules/.bin/opencode
+      # Pinned to the supported maximum in src/index.ts, so release bumps never edit this workflow.
       - name: Install pinned OpenCode 2
-        run: npm install --prefix "$RUNNER_TEMP/opencode-v2" --no-audit --no-fund @opencode/cli@2.1.2
+        run: |
+          version=$(sed -n 's/.*MAX_SUPPORTED_OPENCODE_VERSION = "\([0-9.]*\)".*/\1/p' src/index.ts)
+          test -n "$version"
+          npm install --prefix "$RUNNER_TEMP/opencode-v2" --no-audit --no-fund "@opencode/cli@$version"
       - name: Test OpenCode 2 native-tool guard
         run: npm run test:integration
         env:
