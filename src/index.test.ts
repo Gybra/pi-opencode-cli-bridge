@@ -36,24 +36,24 @@ import type {
   Tool,
   ToolCall,
 } from "@earendil-works/pi-ai";
-import opencodePiExtension, {
-  cleanupPiSessionState,
-  deleteOpenCodeSession,
+import opencodePiExtension from "./index.js";
+import {
   discoverModels,
-  imageContentsForModel,
   isActiveModel,
   isFreeModel,
-  isToolCallMarkerResponse,
   parseModelCost,
-  parseToolCallResponse,
-  parseToolCalls,
   parseVerboseModels,
   reasoningCliArgs,
-  resolveTurnTimeoutMs,
-  streamOpenCode,
-  trackedPiSessionCount,
+} from "./models.js";
+import { imageContentsForModel } from "./prompt.js";
+import { cleanupPiSessionState, deleteOpenCodeSession, trackedPiSessionCount } from "./sessions.js";
+import { resolveTurnTimeoutMs, streamOpenCode } from "./stream.js";
+import {
+  isToolCallMarkerResponse,
+  parseToolCallResponse,
+  parseToolCalls,
   translateNativeToolCall,
-} from "./index.js";
+} from "./tool-calls.js";
 
 function fakeModel(): Model<Api> {
   return {
@@ -2786,7 +2786,7 @@ test("streamOpenCode treats non-JSON stdout lines as diagnostics, not failed tur
 test("streamOpenCode turns invalid CLI envelopes into errors without crashing its host", async () => {
   for (const envelope of [null, [], 42, true, {}, { type: "text", part: null }]) {
     await withFakeOpenCode(fakeEventScript([envelope]), async () => {
-      const script = `import { streamOpenCode } from ${JSON.stringify(new URL("./index.js", import.meta.url).href)};
+      const script = `import { streamOpenCode } from ${JSON.stringify(new URL("./stream.js", import.meta.url).href)};
 const stream = streamOpenCode(${JSON.stringify(fakeModel())}, { messages: [] });
 const events = []; for await (const event of stream) events.push(event.type);
 console.log(JSON.stringify({ events, message: await stream.result() }));`;

@@ -12,7 +12,8 @@ import test from "node:test";
 import { createBashToolDefinition, createReadToolDefinition, createWriteToolDefinition } from "@earendil-works/pi-coding-agent";
 import { validateToolCall } from "@earendil-works/pi-ai";
 import type { Api, Model, SimpleStreamOptions, Tool } from "@earendil-works/pi-ai";
-import { cleanupPiSessionState, streamOpenCode } from "./index.js";
+import { cleanupPiSessionState } from "./sessions.js";
+import { streamOpenCode } from "./stream.js";
 
 const realBin = process.env.OPENCODE_PI_INTEGRATION_BIN || "opencode";
 const version = /\d+\.\d+\.\d+/.exec(execFileSync(realBin, ["--version"], { encoding: "utf8" }))?.[0];
