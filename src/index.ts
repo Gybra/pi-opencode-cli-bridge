@@ -51,7 +51,7 @@ const DEFAULT_TURN_TIMEOUT_MS = 180_000;
 /** Cap on tracked Pi sessions; the oldest entry is evicted with cleanup. */
 const MAX_TRACKED_PI_SESSIONS = 10;
 
-export type CliStatus = {
+type CliStatus = {
   ok: boolean;
   summary: string;
   detail?: string;
@@ -63,7 +63,7 @@ const DEFAULT_FREE_MODELS = [
   "opencode/ling-3.0-flash-fin-free",
   "opencode/big-pickle",
 ];
-export type ModelCost = {
+type ModelCost = {
   input: number;
   output: number;
   cacheRead: number;
@@ -79,7 +79,7 @@ const THINKING_LEVELS = [
   "xhigh",
 ] as const satisfies readonly ModelThinkingLevel[];
 
-export type OpenCodeModelInfo = {
+type OpenCodeModelInfo = {
   id: string;
   name: string;
   reasoning: boolean;
@@ -93,12 +93,12 @@ export type OpenCodeModelInfo = {
   thinkingLevelMap?: ThinkingLevelMap;
 };
 
-export type ParsedToolCall = {
+type ParsedToolCall = {
   name: string;
   arguments: Record<string, unknown>;
 };
 
-export type ToolCallParseResult =
+type ToolCallParseResult =
   | { ok: true; calls: ParsedToolCall[]; cleanedText?: string }
   | {
       ok: false;
@@ -1325,7 +1325,7 @@ export function deleteOpenCodeSession(sessionId: string | undefined): Promise<vo
   return task;
 }
 
-export type PiSessionState = {
+type PiSessionState = {
   /** Lazily created per-Pi-session OpenCode project directory (#74). */
   dirPromise?: Promise<string>;
   /** Recorded OpenCode session ID reused across turns (#75). */

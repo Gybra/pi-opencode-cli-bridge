@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 
-export type ProcessOptions = {
+type ProcessOptions = {
   timeoutMs: number;
   input?: string | (() => string | Promise<string>);
   env?: NodeJS.ProcessEnv;
