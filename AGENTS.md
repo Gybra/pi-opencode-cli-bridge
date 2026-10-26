@@ -34,11 +34,11 @@ You MUST use clear names, straightforward control flow, and familiar patterns. D
 
 Make the intent easy to understand for someone reviewing or maintaining the code. Remove duplication and unnecessary structure, but keep boundaries that make the code clearer.
 
-## Keep Exported Types in a Types Module
+## Keep Exported Types in Domain Type Modules
 
-You MUST declare every exported `type` and `interface` in the package's types module (`src/types.ts`), never in a file that also exports functions, classes, or values. Import them with `import type`.
+You MUST declare every exported `type` and `interface` in the types module of its domain, `src/types/<domain>.ts` (for example `src/types/bridge.ts`), never in a file that also exports functions, classes, or values. Import it directly from that module with `import type`.
 
-A type used by only one file stays in that file, unexported.
+Group types by domain, not one file per type. A type used by only one file stays in that file, unexported.
 
 ## pi-opencode-cli-bridge constraints
 
