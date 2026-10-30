@@ -211,13 +211,14 @@ for (const mode of ["intact", "missing", "failing"] as const) {
     const { message } = await runNativeScenario(mode, piTools);
     assert.equal(message.stopReason, "toolUse", message.errorMessage);
     for (const call of message.content) if (call.type === "toolCall") validateToolCall(piTools, call);
-    assert.deepEqual(
-      message.content.flatMap((c) => c.type === "toolCall" ? [{ name: c.name, arguments: c.arguments }] : []),
-      [
-        { name: "write", arguments: { path: "write-sentinel.txt", content: "native write ran" } },
-        { name: "bash", arguments: { command: "echo native bash ran > bash-sentinel.txt" } },
-      ],
-    );
+    // Parallel native calls arrive in completion order, which is not part of the protocol.
+    const calls = message.content
+      .flatMap((c) => c.type === "toolCall" ? [{ name: c.name, arguments: c.arguments }] : [])
+      .sort((a, b) => a.name.localeCompare(b.name));
+    assert.deepEqual(calls, [
+      { name: "bash", arguments: { command: "echo native bash ran > bash-sentinel.txt" } },
+      { name: "write", arguments: { path: "write-sentinel.txt", content: "native write ran" } },
+    ]);
   });
 }
 
