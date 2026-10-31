@@ -44,7 +44,7 @@ The signed-send approval flow in pi-whatsapp and pi-tg solves a different proble
 
 ### 1. Timeout and cancellation do not guarantee process termination
 
-**Where:** `src/index.ts:1448-1456` and the wait for `close` at `src/index.ts:1547-1556`. Discovery and session-deletion helpers have similar termination assumptions.
+**Where:** `runOpenCodeProcess` in `src/process.ts`, including the wait for the child's `close`. Discovery and session-deletion helpers have similar termination assumptions.
 
 **Concrete case:** a fake OpenCode process installs a no-op `SIGTERM` handler and exits naturally after three seconds. With `timeoutMs: 1000`, the bridge returned only after about 3399 ms. A process that never exits can keep the stream pending indefinitely. The original live high-thinking test also remained pending beyond the expected turn bound, although that alone does not establish the CLI's internal cause.
 
@@ -54,7 +54,7 @@ The signed-send approval flow in pi-whatsapp and pi-tg solves a different proble
 
 ### 2. Valid JSON with an invalid event envelope still crashes Pi
 
-**Where:** `src/index.ts:1462-1479`, called from the stdout `data` handler.
+**Where:** `handleOpenCodeLine` in `src/stream.ts`, wired to the stdout stream by `streamOpenCodeAttempt`.
 
 **Concrete case:** a fake CLI writes `null\n`. JSON parsing succeeds, then `event.sessionID` throws `TypeError: Cannot read properties of null (reading 'sessionID')`. The host process exits with code 1. The outer async `try/catch` does not catch exceptions thrown later by an EventEmitter callback.
 
@@ -66,7 +66,7 @@ The signed-send approval flow in pi-whatsapp and pi-tg solves a different proble
 
 ### 3. Shutdown starts cleanup without letting Pi await it
 
-**Where:** `src/index.ts:1833-1835`.
+**Where:** the `session_shutdown` handler in `src/index.ts`.
 
 The `session_shutdown` callback calls `void cleanupPiSessionState()`. The reference integrations return an async handler and await cleanup before disposing session resources. Here Pi receives no promise to wait for, so directory removal is not guaranteed to finish at shutdown or reload. OpenCode session deletion is separately fire-and-forget.
 
@@ -76,7 +76,7 @@ The `session_shutdown` callback calls `void cleanupPiSessionState()`. The refere
 
 ### 4. Pi's provider instrumentation callbacks are ignored
 
-**Where:** `streamOpenCode` in `src/index.ts`, including subprocess setup and `handleLine`.
+**Where:** `streamOpenCodeAttempt` in `src/stream.ts`, including subprocess setup and `handleOpenCodeLine`.
 
 Pi's custom-provider contract includes `onPayload`, `onResponse` and `onProviderStreamEvent`. A runtime probe supplied all three callbacks; a successful fake response invoked none. Request inspection and transformations supplied by callers are therefore not honored, and raw event observers see no CLI events.
 
@@ -86,7 +86,7 @@ Pi's custom-provider contract includes `onPayload`, `onResponse` and `onProvider
 
 ### 5. The native-tool blocker has no negative integration coverage
 
-**Where:** generated `tool.execute.before` plugin in `src/index.ts:1299-1329`; current tests in `src/index.test.ts`.
+**Where:** the generated `tool.execute.before` plugin in `src/sessions.ts`; current tests in `src/index.test.ts`.
 
 The tests replace OpenCode with a fake executable. The live Pi read test proves that marker calls can reach Pi, not that OpenCode's native file or shell tools cannot execute. This fork keeps native declarations enabled and relies on the plugin being loaded and invoked before side effects.
 
