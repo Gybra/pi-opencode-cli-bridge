@@ -1,6 +1,6 @@
 {
   "name": "pi-opencode-cli-bridge",
-  "version": "0.2.15",
+  "version": "0.2.16",
   "description": "Bridge the OpenCode CLI into Pi Coding Agent",
   "type": "module",
   "main": "./src/index.ts",

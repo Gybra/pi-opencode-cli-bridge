@@ -9,7 +9,7 @@ import type { OpenCodeModelInfo } from "./types/models.js";
 
 const PROVIDER_ID = "opencode-cli";
 const API_ID = "opencode-cli-runner";
-const MAX_SUPPORTED_OPENCODE_VERSION = "2.2.4";
+const MAX_SUPPORTED_OPENCODE_VERSION = "2.2.5";
 let registeredModels: OpenCodeModelInfo[] = [];
 let lastDiscoveryTime: number | undefined;
 let lastDiscoveryError: string | undefined;
