@@ -88,16 +88,16 @@ For an isolated text smoke test:
 pi -p --no-session --provider opencode-cli --model opencode/deepseek-v4.1-flash-free --thinking off "Reply with exactly OK"
 ```
 
-Model availability changes. Refresh the list with `/opencode-pi update` if the example model is no longer listed. Bundled free models do not require an OpenCode login; availability and server-side acceptance are controlled by OpenCode.
+Model availability changes. Refresh the list with `/pi-opencode-cli-bridge update` if the example model is no longer listed. Bundled free models do not require an OpenCode login; availability and server-side acceptance are controlled by OpenCode.
 
-The provider ID `opencode-cli` and the command `/opencode-pi` retain their upstream names for compatibility:
+The command is `/pi-opencode-cli-bridge`; it replaces `/opencode-pi`, which is no longer registered. The provider ID `opencode-cli` and the `OPENCODE_PI_*` environment variables remain unchanged for compatibility:
 
 ```text
-/opencode-pi status
-/opencode-pi models
-/opencode-pi test
-/opencode-pi update
-/opencode-pi help
+/pi-opencode-cli-bridge status
+/pi-opencode-cli-bridge models
+/pi-opencode-cli-bridge test
+/pi-opencode-cli-bridge update
+/pi-opencode-cli-bridge help
 ```
 
 The `test` command prints diagnostic commands; it does not send a model request itself.
@@ -109,7 +109,7 @@ The `test` command prints diagnostic commands; it does not send a model request 
 | `OPENCODE_PI_BIN` | Path to the OpenCode executable. Defaults to `opencode`. |
 | `OPENCODE_PI_MODELS` | Comma- or space-separated model IDs. IDs without a provider prefix receive `opencode/`. |
 
-An explicit model list skips startup discovery and starts with conservative fallback capabilities. Run `/opencode-pi update` to discover image input, reasoning variants, token limits and costs.
+An explicit model list skips startup discovery and starts with conservative fallback capabilities. Run `/pi-opencode-cli-bridge update` to discover image input, reasoning variants, token limits and costs.
 
 Without an override, discovery selects active `opencode/` models whose reported input and output costs are zero. OpenCode 2.x discovery uses the local `/api/model` endpoint, excludes disabled models, and checks every pricing tier before selecting a free model. For explicitly configured tiered models, displayed costs conservatively use the highest reported rate for each cost field. When cost metadata is missing, selection falls back to the upstream free-model naming rules. Review costs before explicitly selecting a paid model.
 

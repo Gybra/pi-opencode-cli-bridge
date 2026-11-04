@@ -46,7 +46,7 @@ import {
   reasoningCliArgs,
 } from "./models.js";
 import { imageContentsForModel } from "./prompt.js";
-import { cleanupPiSessionState, deleteOpenCodeSession, trackedPiSessionCount } from "./sessions.js";
+import { cleanupPiSessionState, createTempAgentDir, deleteOpenCodeSession, trackedPiSessionCount } from "./sessions.js";
 import { resolveTurnTimeoutMs, streamOpenCode } from "./stream.js";
 import {
   isToolCallMarkerResponse,
@@ -144,7 +144,7 @@ async function withFakeOpenCode<T>(
   run: () => Promise<T>,
   version = "1.19.0",
 ): Promise<T> {
-  const dir = mkdtempSync(join(tmpdir(), "opencode-pi-fake-bin-"));
+  const dir = mkdtempSync(join(tmpdir(), "pi-opencode-cli-bridge-fake-bin-"));
   const binPath = join(dir, "opencode-fake.js");
   writeFileSync(binPath, `#!/usr/bin/env node\nif (process.argv[2] === "--version") { console.log(${JSON.stringify(version)}); process.exit(0); }\n${script}`, "utf8");
   chmodSync(binPath, 0o755);
@@ -175,7 +175,7 @@ async function invalidImageResult(
   mimeType: string,
   data: string,
 ): Promise<{ message: Awaited<ReturnType<ReturnType<typeof streamOpenCode>["result"]>>; spawned: boolean }> {
-  const sentinelDir = mkdtempSync(join(tmpdir(), "opencode-pi-sentinel-"));
+  const sentinelDir = mkdtempSync(join(tmpdir(), "pi-opencode-cli-bridge-sentinel-"));
   const sentinelPath = join(sentinelDir, "ran.marker");
   try {
     const message = await withFakeOpenCode(
@@ -1357,12 +1357,12 @@ test("translateNativeToolCall maps blocked OpenCode calls onto arguments Pi's re
 });
 
 test("translateNativeToolCall recognizes Windows temp-project paths regardless of slashes and case", () => {
-  const dirs = ["C:\\Users\\Me\\AppData\\Local\\Temp\\opencode-pi-1"];
+  const dirs = ["C:\\Users\\Me\\AppData\\Local\\Temp\\pi-opencode-cli-bridge-1"];
   const t = (input: unknown, tool = "read") => translateNativeToolCall(tool, input, new Set(["read", "bash"]), dirs, win32);
-  assert.deepEqual(t({ filePath: "c:/users/me/appdata/local/temp/opencode-pi-1/src/a.ts" }), { name: "read", arguments: { path: "src\\a.ts" } });
-  assert.deepEqual(t({ filePath: "C:\\Users\\Me\\AppData\\Local\\Temp\\opencode-pi-1\\a.ts" }), { name: "read", arguments: { path: "a.ts" } });
+  assert.deepEqual(t({ filePath: "c:/users/me/appdata/local/temp/pi-opencode-cli-bridge-1/src/a.ts" }), { name: "read", arguments: { path: "src\\a.ts" } });
+  assert.deepEqual(t({ filePath: "C:\\Users\\Me\\AppData\\Local\\Temp\\pi-opencode-cli-bridge-1\\a.ts" }), { name: "read", arguments: { path: "a.ts" } });
   assert.deepEqual(t({ filePath: "D:/repo/a.ts" }), { name: "read", arguments: { path: "D:/repo/a.ts" } });
-  assert.deepEqual(t({ command: "dir", workdir: "C:/Users/Me/AppData/Local/Temp/opencode-pi-1/" }, "bash"), { name: "bash", arguments: { command: "dir" } });
+  assert.deepEqual(t({ command: "dir", workdir: "C:/Users/Me/AppData/Local/Temp/pi-opencode-cli-bridge-1/" }, "bash"), { name: "bash", arguments: { command: "dir" } });
 });
 
 test("streamOpenCode turns a translatable native step into Pi tool calls and stops OpenCode", async () => {
@@ -1415,7 +1415,7 @@ for (const version of ["2.2.6", "2.2.100", "2.3.0", "3.0.0"]) {
       }, `opencode ${version}`);
       const warnings = ctx.notifications.filter((n) => n.level === "warning");
       assert.equal(warnings.length, 1);
-      assert.equal(warnings[0]!.message, `opencode-pi: detected OpenCode ${version}. This bridge supports OpenCode up to 2.2.5. Please install a supported version.`);
+      assert.equal(warnings[0]!.message, `pi-opencode-cli-bridge: detected OpenCode ${version}. This bridge supports OpenCode up to 2.2.5. Please install a supported version.`);
     } finally {
       restoreEnv("OPENCODE_PI_MODELS", previousModels);
     }
@@ -1466,7 +1466,7 @@ test("streamOpenCode diagnoses empty output with whitespace-only text events", a
 });
 
 test("streamOpenCode never spawns opencode when the signal aborts before the child is launched", async () => {
-  const sentinelDir = mkdtempSync(join(tmpdir(), "opencode-pi-sentinel-"));
+  const sentinelDir = mkdtempSync(join(tmpdir(), "pi-opencode-cli-bridge-sentinel-"));
   const sentinelPath = join(sentinelDir, "ran.marker");
 
   try {
@@ -1486,7 +1486,7 @@ test("streamOpenCode never spawns opencode when the signal aborts before the chi
 });
 
 test("streamOpenCode spawns opencode and returns its output when not aborted", async () => {
-  const sentinelDir = mkdtempSync(join(tmpdir(), "opencode-pi-sentinel-"));
+  const sentinelDir = mkdtempSync(join(tmpdir(), "pi-opencode-cli-bridge-sentinel-"));
   const sentinelPath = join(sentinelDir, "ran.marker");
 
   try {
@@ -1504,7 +1504,7 @@ process.stdout.write(JSON.stringify({ type: "text", part: { text: "ok" } }) + "\
 });
 
 test("streamOpenCode never spawns opencode when the signal aborts after image file setup", async () => {
-  const sentinelDir = mkdtempSync(join(tmpdir(), "opencode-pi-sentinel-"));
+  const sentinelDir = mkdtempSync(join(tmpdir(), "pi-opencode-cli-bridge-sentinel-"));
   const sentinelPath = join(sentinelDir, "ran.marker");
 
   try {
@@ -1695,7 +1695,7 @@ test("streamOpenCode returns the expected error outcome when opencode times out"
 });
 
 test("streamOpenCode forwards reasoning settings and image files to opencode", async () => {
-  const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
+  const captureDir = mkdtempSync(join(tmpdir(), "pi-opencode-cli-bridge-capture-"));
   const capturePath = join(captureDir, "invocation.json");
   const model: Model<Api> = {
     ...fakeModel(),
@@ -1788,7 +1788,7 @@ test("streamOpenCode rejects empty decoded images before provider execution", as
 });
 
 test("discoverModels bypasses opencode discovery when OPENCODE_PI_MODELS is set", async () => {
-  const sentinelDir = mkdtempSync(join(tmpdir(), "opencode-pi-sentinel-"));
+  const sentinelDir = mkdtempSync(join(tmpdir(), "pi-opencode-cli-bridge-sentinel-"));
   const sentinelPath = join(sentinelDir, "ran.marker");
   const previousModels = process.env.OPENCODE_PI_MODELS;
   process.env.OPENCODE_PI_MODELS = "custom-model-a, opencode/custom-model-b";
@@ -1815,7 +1815,7 @@ test("discoverModels runs opencode discovery and filters to free models when OPE
   const previousModels = process.env.OPENCODE_PI_MODELS;
   const previousBin = process.env.OPENCODE_PI_BIN;
   delete process.env.OPENCODE_PI_MODELS;
-  const dir = mkdtempSync(join(tmpdir(), "opencode-pi-fake-bin-"));
+  const dir = mkdtempSync(join(tmpdir(), "pi-opencode-cli-bridge-fake-bin-"));
   const binPath = join(dir, "opencode-fake.js");
   writeFileSync(
     binPath,
@@ -1934,7 +1934,7 @@ test("discoverModels with forceDiscovery still enriches configured models from o
   const previousModels = process.env.OPENCODE_PI_MODELS;
   const previousBin = process.env.OPENCODE_PI_BIN;
   process.env.OPENCODE_PI_MODELS = "custom-reasoner-free";
-  const dir = mkdtempSync(join(tmpdir(), "opencode-pi-fake-bin-"));
+  const dir = mkdtempSync(join(tmpdir(), "pi-opencode-cli-bridge-fake-bin-"));
   const binPath = join(dir, "opencode-fake.js");
   writeFileSync(
     binPath,
@@ -2006,11 +2006,47 @@ function recordingCtx(): {
   };
 }
 
+test("extension exposes only the renamed command and points users to it", async () => {
+  const previousModels = process.env.OPENCODE_PI_MODELS;
+  process.env.OPENCODE_PI_MODELS = "opencode/fake-free";
+  const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+  try {
+    await opencodePiExtension({
+      registerProvider() {},
+      on() {},
+      registerCommand(name: string, command: Parameters<ExtensionAPI["registerCommand"]>[1]) {
+        commands.set(name, command);
+      },
+    } as unknown as ExtensionAPI);
+
+    assert.deepEqual([...commands.keys()], ["pi-opencode-cli-bridge"]);
+    const command = commands.get("pi-opencode-cli-bridge")!;
+    for (const args of ["help", "status", "unknown"]) {
+      const ctx = recordingCtx();
+      await command.handler(args, ctx as unknown as Parameters<typeof command.handler>[1]);
+      const output = ctx.notifications.map((n) => n.message).join("\n");
+      assert.match(output, /\/pi-opencode-cli-bridge/);
+      assert.doesNotMatch(output, /\/opencode-pi/);
+    }
+  } finally {
+    restoreEnv("OPENCODE_PI_MODELS", previousModels);
+  }
+});
+
+test("temporary project directories use the package name", async () => {
+  const dir = await createTempAgentDir();
+  try {
+    assert.match(basename(dir), /^pi-opencode-cli-bridge-/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("session_start warns with setup guidance when the opencode binary is missing", async () => {
   const previousModels = process.env.OPENCODE_PI_MODELS;
   delete process.env.OPENCODE_PI_MODELS;
   const previousBin = process.env.OPENCODE_PI_BIN;
-  process.env.OPENCODE_PI_BIN = join(tmpdir(), "opencode-pi-does-not-exist");
+  process.env.OPENCODE_PI_BIN = join(tmpdir(), "pi-opencode-cli-bridge-does-not-exist");
 
   try {
     const recorder = sessionStartRecorder();
@@ -2021,7 +2057,8 @@ test("session_start warns with setup guidance when the opencode binary is missin
 
     const warnings = ctx.notifications.filter((n) => n.level === "warning");
     assert.equal(warnings.length, 1);
-    assert.match(warnings[0]!.message, /could not use the local OpenCode CLI/);
+    assert.match(warnings[0]!.message, /^pi-opencode-cli-bridge:/);
+    assert.match(warnings[0]!.message, /pi-opencode-cli-bridge could not use the local OpenCode CLI/);
     assert.match(warnings[0]!.message, /Reason:/);
     assert.match(warnings[0]!.message, /Install OpenCode/);
     assert.equal(
@@ -2038,7 +2075,7 @@ test("session_start flags the OPENCODE_PI_MODELS fast path when the binary is mi
   const previousModels = process.env.OPENCODE_PI_MODELS;
   process.env.OPENCODE_PI_MODELS = "custom-model-a";
   const previousBin = process.env.OPENCODE_PI_BIN;
-  process.env.OPENCODE_PI_BIN = join(tmpdir(), "opencode-pi-does-not-exist");
+  process.env.OPENCODE_PI_BIN = join(tmpdir(), "pi-opencode-cli-bridge-does-not-exist");
 
   try {
     const recorder = sessionStartRecorder();
@@ -2188,7 +2225,7 @@ test("discoverModels selects zero-cost models and skips inactive ones", async ()
   const previousModels = process.env.OPENCODE_PI_MODELS;
   const previousBin = process.env.OPENCODE_PI_BIN;
   delete process.env.OPENCODE_PI_MODELS;
-  const dir = mkdtempSync(join(tmpdir(), "opencode-pi-fake-bin-"));
+  const dir = mkdtempSync(join(tmpdir(), "pi-opencode-cli-bridge-fake-bin-"));
   const binPath = join(dir, "opencode-fake.js");
   writeFileSync(
     binPath,
@@ -2238,7 +2275,7 @@ test("discoverModels reports real cost for a configured paid model", async () =>
   const previousModels = process.env.OPENCODE_PI_MODELS;
   const previousBin = process.env.OPENCODE_PI_BIN;
   process.env.OPENCODE_PI_MODELS = "opencode/paid-model";
-  const dir = mkdtempSync(join(tmpdir(), "opencode-pi-fake-bin-"));
+  const dir = mkdtempSync(join(tmpdir(), "pi-opencode-cli-bridge-fake-bin-"));
   const binPath = join(dir, "opencode-fake.js");
   writeFileSync(
     binPath,
@@ -2279,7 +2316,7 @@ test("discoverModels falls back to live free model IDs when discovery fails", as
   const previousModels = process.env.OPENCODE_PI_MODELS;
   const previousBin = process.env.OPENCODE_PI_BIN;
   delete process.env.OPENCODE_PI_MODELS;
-  const dir = mkdtempSync(join(tmpdir(), "opencode-pi-fake-bin-"));
+  const dir = mkdtempSync(join(tmpdir(), "pi-opencode-cli-bridge-fake-bin-"));
   const binPath = join(dir, "opencode-fake.js");
   writeFileSync(
     binPath,
@@ -2407,7 +2444,7 @@ test("streamOpenCode accepts tool calls from normalized system declarations", { 
 });
 
 test("streamOpenCode replays normalized prompt sections and tool changes", { timeout: 3000 }, async () => {
-  const dir = mkdtempSync(join(tmpdir(), "opencode-pi-normalized-"));
+  const dir = mkdtempSync(join(tmpdir(), "pi-opencode-cli-bridge-normalized-"));
   const capturePath = join(dir, "invocations.jsonl");
   try {
     const message = await withFakeOpenCode(sessionFakeScript(capturePath, "ses-normalized"), () =>
@@ -2487,7 +2524,7 @@ function conversationContext(): Context {
 }
 
 test("streamOpenCode reuses the session and sends only the transcript delta", async () => {
-  const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
+  const captureDir = mkdtempSync(join(tmpdir(), "pi-opencode-cli-bridge-capture-"));
   const capturePath = join(captureDir, "invocations.jsonl");
   const piSessionId = `pi-reuse-${Date.now()}`;
   try {
@@ -2533,7 +2570,7 @@ test("streamOpenCode reuses the session and sends only the transcript delta", as
 });
 
 test("streamOpenCode starts fresh after an error drops the session", async () => {
-  const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
+  const captureDir = mkdtempSync(join(tmpdir(), "pi-opencode-cli-bridge-capture-"));
   const capturePath = join(captureDir, "invocations.jsonl");
   const piSessionId = `pi-drop-${Date.now()}`;
   try {
@@ -2588,7 +2625,7 @@ process.stdin.on("end", () => {
 });
 
 test("streamOpenCode restarts the session when tools change", async () => {
-  const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
+  const captureDir = mkdtempSync(join(tmpdir(), "pi-opencode-cli-bridge-capture-"));
   const capturePath = join(captureDir, "invocations.jsonl");
   const piSessionId = `pi-tools-${Date.now()}`;
   try {
@@ -2623,7 +2660,7 @@ test("streamOpenCode restarts the session when tools change", async () => {
 });
 
 test("streamOpenCode runs isolated fresh sessions without a Pi session ID", async () => {
-  const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
+  const captureDir = mkdtempSync(join(tmpdir(), "pi-opencode-cli-bridge-capture-"));
   const capturePath = join(captureDir, "invocations.jsonl");
   try {
     for (const question of ["q1", "q2"]) {
@@ -2803,7 +2840,7 @@ console.log(JSON.stringify({ events, message: await stream.result() }));`;
 });
 
 test("session_shutdown waits for project removal and OpenCode deletion", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "opencode-pi-shutdown-"));
+  const dir = mkdtempSync(join(tmpdir(), "pi-opencode-cli-bridge-shutdown-"));
   const capture = join(dir, "calls.jsonl");
   const deleted = join(dir, "deleted");
   const sessionId = "pi-await-shutdown";
@@ -2839,7 +2876,7 @@ test("deleteOpenCodeSession never throws without a session ID", () => {
 });
 
 test("cleanupPiSessionState removes the project directory at teardown", async () => {
-  const captureDir = mkdtempSync(join(tmpdir(), "opencode-pi-capture-"));
+  const captureDir = mkdtempSync(join(tmpdir(), "pi-opencode-cli-bridge-capture-"));
   const capturePath = join(captureDir, "invocations.jsonl");
   const piSessionId = `pi-teardown-${Date.now()}`;
   let before = 0;
@@ -2932,7 +2969,7 @@ process.stdout.write(JSON.stringify({ type: "text", part: { text: "v2 reply" } }
 for (const executable of ["relative", "PATH"] as const) {
   test(`OpenCode 2 launches a configured ${executable} executable from its isolated project`, async () => {
     const previousPath = process.env.PATH;
-    const dir = mkdtempSync(join(process.cwd(), ".opencode-pi-bin-"));
+    const dir = mkdtempSync(join(process.cwd(), ".pi-opencode-cli-bridge-bin-"));
     try {
       const message = await withFakeOpenCode(fakeEventScript([
         { type: "text", part: { text: "configured executable ran" } },

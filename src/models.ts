@@ -299,7 +299,7 @@ export async function discoverModels(opts?: {
   // models to register, so the fast (non-forced) path skips spawning
   // opencode entirely rather than making explicitly configured users pay a
   // discovery timeout on every startup when the binary is missing or slow.
-  // `forceDiscovery` (used by the user-initiated /opencode-pi update
+  // `forceDiscovery` (used by the user-initiated /pi-opencode-cli-bridge update
   // command) still runs discovery so configured models can be enriched with
   // real capability metadata (reasoning/image/limits) on request.
   if (configured?.length && !opts?.forceDiscovery) {

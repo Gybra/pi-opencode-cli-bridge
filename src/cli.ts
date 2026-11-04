@@ -55,7 +55,7 @@ export function runCapture(
 /** Build the install/setup instructions shown when the opencode CLI is unusable. */
 export function setupGuidance(error: string): string {
   return [
-    "opencode-pi could not use the local OpenCode CLI.",
+    "pi-opencode-cli-bridge could not use the local OpenCode CLI.",
     `Reason: ${error}`,
     "Install OpenCode (https://opencode.ai), ensure `opencode --version` works on PATH, then reload Pi.",
     "Set OPENCODE_PI_BIN to override the executable path.",

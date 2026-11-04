@@ -45,7 +45,7 @@ async function refreshModels(
 
   const newModels = models.filter((model) => !previousModels.has(model.id));
 
-  let msg = `opencode-pi: refreshed ${models.length} model(s).`;
+  let msg = `pi-opencode-cli-bridge: refreshed ${models.length} model(s).`;
   if (newModels.length > 0) {
     msg += ` ${newModels.length} new: ${newModels
       .slice(0, 5)
@@ -77,7 +77,7 @@ function statusLines(): string[] {
   const lines = [
     `Provider: ${PROVIDER_ID}`,
     `OpenCode binary: ${opencodeBin()}`,
-    `OpenCode installed: ${existsSync(opencodeBin()) || opencodeBin() === "opencode" ? "check PATH with /opencode-pi test" : "no"}`,
+    `OpenCode installed: ${existsSync(opencodeBin()) || opencodeBin() === "opencode" ? "check PATH with /pi-opencode-cli-bridge test" : "no"}`,
     `Registered models: ${registeredModels.length}`,
     `Last discovery: ${lastDiscoveryTime ? new Date(lastDiscoveryTime).toLocaleString() : "never"}`,
   ];
@@ -101,7 +101,7 @@ function statusLines(): string[] {
     "OpenCode tools are disabled; Pi tool use is bridged with prompt-level tool-call markers.",
   );
   lines.push(
-    "Run /opencode-pi update to refresh the model list from opencode.",
+    "Run /pi-opencode-cli-bridge update to refresh the model list from opencode.",
   );
   return lines;
 }
@@ -146,31 +146,31 @@ export default async function opencodePiExtension(pi: ExtensionAPI) {
         ? "OPENCODE_PI_MODELS skipped discovery, so this was not detected at startup. "
         : "";
       ctx.ui.notify(
-        `opencode-pi: ${fastPathNote}${setupGuidance(cliStatus.detail ?? cliStatus.summary)}`,
+        `pi-opencode-cli-bridge: ${fastPathNote}${setupGuidance(cliStatus.detail ?? cliStatus.summary)}`,
         "warning",
       );
       return;
     }
     ctx.ui.notify(
-      `opencode-pi: registered ${registeredModels.length} OpenCode CLI model(s). Use /model and pick ${PROVIDER_ID}.`,
+      `pi-opencode-cli-bridge: registered ${registeredModels.length} OpenCode CLI model(s). Use /model and pick ${PROVIDER_ID}.`,
       "info",
     );
     const version = /\d+\.\d+\.\d+/.exec(cliStatus.summary)?.[0];
     if (!version || version.localeCompare(MAX_SUPPORTED_OPENCODE_VERSION, undefined, { numeric: true }) > 0) {
       ctx.ui.notify(
-        `opencode-pi: detected OpenCode ${version ?? cliStatus.summary}. This bridge supports OpenCode up to ${MAX_SUPPORTED_OPENCODE_VERSION}. Please install a supported version.`,
+        `pi-opencode-cli-bridge: detected OpenCode ${version ?? cliStatus.summary}. This bridge supports OpenCode up to ${MAX_SUPPORTED_OPENCODE_VERSION}. Please install a supported version.`,
         "warning",
       );
     }
     if (lastDiscoveryError) {
       ctx.ui.notify(
-        `opencode-pi: model discovery used fallback (${lastDiscoveryError})`,
+        `pi-opencode-cli-bridge: model discovery used fallback (${lastDiscoveryError})`,
         "warning",
       );
     }
   });
 
-  pi.registerCommand("opencode-pi", {
+  pi.registerCommand("pi-opencode-cli-bridge", {
     description: "OpenCode CLI bridge status and setup help",
     handler: async (args: string, ctx: any) => {
       const sub = args.trim().split(/\s+/).filter(Boolean)[0] ?? "status";
@@ -205,7 +205,7 @@ export default async function opencodePiExtension(pi: ExtensionAPI) {
       }
       if (sub === "help") {
         ctx.ui.notify(
-          "Usage: /opencode-pi [status|models|test|update|help]",
+          "Usage: /pi-opencode-cli-bridge [status|models|test|update|help]",
           "info",
         );
         ctx.ui.notify(
@@ -219,7 +219,7 @@ export default async function opencodePiExtension(pi: ExtensionAPI) {
         return;
       }
       ctx.ui.notify(
-        `Unknown /opencode-pi subcommand: ${sub}. Try /opencode-pi help`,
+        `Unknown /pi-opencode-cli-bridge subcommand: ${sub}. Try /pi-opencode-cli-bridge help`,
         "warning",
       );
     },
