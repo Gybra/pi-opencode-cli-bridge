@@ -136,7 +136,7 @@ export function continuationDelta(
 }
 
 export async function createTempAgentDir(): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), "opencode-pi-"));
+  const dir = await mkdtemp(join(tmpdir(), "pi-opencode-cli-bridge-"));
   const configDir = join(dir, ".opencode");
   const agentsDir = join(configDir, "agents");
   const pluginsDir = join(configDir, "plugins");
