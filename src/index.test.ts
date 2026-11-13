@@ -1402,7 +1402,7 @@ test("streamOpenCode accepts the model's recovery after an untranslatable native
   assert.match(unrecovered.errorMessage ?? "", /after one recovery attempt.*blocked native tool: "webfetch"/);
 });
 
-for (const version of ["2.2.8", "2.2.100", "2.3.0", "3.0.0"]) {
+for (const version of ["2.3.1", "2.3.100", "2.4.0", "3.0.0"]) {
   test(`session_start warns that OpenCode ${version} exceeds the supported maximum`, async () => {
     const previousModels = process.env.OPENCODE_PI_MODELS;
     process.env.OPENCODE_PI_MODELS = "custom-model-a";
@@ -1415,7 +1415,7 @@ for (const version of ["2.2.8", "2.2.100", "2.3.0", "3.0.0"]) {
       }, `opencode ${version}`);
       const warnings = ctx.notifications.filter((n) => n.level === "warning");
       assert.equal(warnings.length, 1);
-      assert.equal(warnings[0]!.message, `pi-opencode-cli-bridge: detected OpenCode ${version}. This bridge supports OpenCode up to 2.2.7. Please install a supported version.`);
+      assert.equal(warnings[0]!.message, `pi-opencode-cli-bridge: detected OpenCode ${version}. This bridge supports OpenCode up to 2.3.0. Please install a supported version.`);
     } finally {
       restoreEnv("OPENCODE_PI_MODELS", previousModels);
     }
@@ -3002,7 +3002,7 @@ test("OpenCode 2 shell calls translate to Pi bash without dropping unsupported e
   assert.equal(translate({ command: "npm test", timeout: 0 }), undefined);
 });
 
-for (const version of ["1.19.0", "2.0.9", "2.0.29", "2.0.30", "2.0.31", "2.0.32", "2.1.2", "2.1.4", "2.2.0", "2.2.4", "2.2.5", "2.2.6", "2.2.7"]) {
+for (const version of ["1.19.0", "2.0.9", "2.0.29", "2.0.30", "2.0.31", "2.0.32", "2.1.2", "2.1.4", "2.2.0", "2.2.4", "2.2.5", "2.2.6", "2.2.7", "2.3.0"]) {
   test(`session_start accepts OpenCode ${version} up to the supported maximum`, async () => {
     const previous = process.env.OPENCODE_PI_MODELS;
     process.env.OPENCODE_PI_MODELS = "big-pickle";
